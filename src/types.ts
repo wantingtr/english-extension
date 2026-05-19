@@ -1,0 +1,37 @@
+export type RewriteMode = "auto" | "zh-to-en" | "en-assist";
+
+export type ResolvedRewriteMode = Exclude<RewriteMode, "auto">;
+
+export type Settings = {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  difficulty: number;
+  concentration: number;
+  coverage: number;
+};
+
+export type TextChunk = {
+  id: string;
+  text: string;
+};
+
+export type RewriteReplacement = {
+  chunkId: string;
+  original: string;
+  replacement: string;
+  explanation: string;
+  type: "word" | "phrase" | "sentence";
+};
+
+export type RewriteRequest = {
+  url: string;
+  title: string;
+  mode: ResolvedRewriteMode;
+  chunks: TextChunk[];
+};
+
+export type RewriteResponse = {
+  replacements: RewriteReplacement[];
+  cached: boolean;
+};

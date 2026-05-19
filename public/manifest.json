@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "英语浸泡工具",
+  "description": "用 AI 将中文或英文网页改造成英语学习环境。",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "英语浸泡",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["https://api.siliconflow.cn/*", "https://api.siliconflow.com/*"],
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["assets/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
