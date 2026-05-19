@@ -70,8 +70,8 @@ function App() {
     <main className="popup">
       <header>
         <div>
-          <p className="eyebrow">English Immersion</p>
-          <h1>英语浸泡</h1>
+          <p className="eyebrow">Context English</p>
+          <h1>语境英语</h1>
         </div>
         <button className="iconButton" onClick={openOptions} title="打开设置">
           ⚙

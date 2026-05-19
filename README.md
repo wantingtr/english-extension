@@ -1,6 +1,6 @@
-# 英语浸泡 Chrome 插件 MVP
+# 语境英语
 
-一个本地自用的 Chrome Manifest V3 插件，用硅基流动 OpenAI-compatible API 将网页正文改造成英语学习环境。
+一个本地自用的 Chrome Manifest V3 插件，用硅基流动 OpenAI-compatible API 在真实网页语境中生成可控的英语接触。
 
 ## 使用
 
