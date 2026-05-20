@@ -21,11 +21,11 @@ const concentrationLabels = [
 ];
 
 const coverageLabels = [
-  "1 档：很小，只处理前 6 段",
-  "2 档：较小，处理前 10 段",
-  "3 档：适中，处理前 14 段",
-  "4 档：较大，处理前 18 段",
-  "5 档：很大，处理前 24 段"
+  "1 档：全文扫描，顶部优先 + 少量抽样",
+  "2 档：全文扫描，顶部优先 + 较低抽样",
+  "3 档：全文扫描，顶部优先 + 适中抽样",
+  "4 档：全文扫描，顶部优先 + 较高抽样",
+  "5 档：全文扫描，顶部优先 + 高抽样"
 ];
 
 type DebugLog = {
@@ -35,17 +35,31 @@ type DebugLog = {
   mode: string;
   model: string;
   baseUrl: string;
+  requestUrl?: string;
   hasApiKey: boolean;
+  hostPermissionGranted?: boolean;
   difficulty: number;
   concentration: number;
   coverage: number;
+  sourceChunkCount?: number;
   chunks: Array<{ id: string; text: string }>;
   httpStatus?: number;
   rawResponse?: string;
   parsedCount?: number;
   sanitizedCount?: number;
   cached?: boolean;
+  batchStatuses?: Array<{
+    index: number;
+    chunkIds: string[];
+    elapsedMs?: number;
+    httpStatus?: number;
+    parsedCount?: number;
+    sanitizedCount?: number;
+    error?: string;
+  }>;
   error?: string;
+  networkErrorName?: string;
+  networkErrorDetails?: string;
 };
 
 function App() {
@@ -136,7 +150,7 @@ function App() {
             <span className="hint">{concentrationLabels[settings.concentration - 1]}</span>
           </label>
           <label>
-            替换范围
+            覆盖密度
             <input
               type="range"
               min="1"
@@ -175,13 +189,19 @@ function App() {
             <DebugField label="模式" value={debugLog.mode} />
             <DebugField label="模型" value={debugLog.model} />
             <DebugField label="Base URL" value={debugLog.baseUrl} />
+            <DebugField label="请求 URL" value={debugLog.requestUrl ?? "无"} />
             <DebugField label="API key" value={debugLog.hasApiKey ? "已填写" : "未填写"} />
+            <DebugField label="Host 权限" value={debugLog.hostPermissionGranted === undefined ? "无" : debugLog.hostPermissionGranted ? "已授权" : "未授权"} />
             <DebugField label="HTTP 状态" value={debugLog.httpStatus ?? "无"} />
-            <DebugField label="替换范围" value={debugLog.coverage ?? "无"} />
+            <DebugField label="覆盖密度" value={debugLog.coverage ?? "无"} />
+            <DebugField label="全文段数" value={debugLog.sourceChunkCount ?? debugLog.chunks.length} />
+            <DebugField label="请求段数" value={debugLog.chunks.length} />
             <DebugField label="解析数量" value={debugLog.parsedCount ?? "无"} />
             <DebugField label="有效替换" value={debugLog.sanitizedCount ?? "无"} />
+            <DebugField label="请求批次" value={debugLog.batchStatuses?.length ?? "无"} />
             <DebugField label="缓存" value={debugLog.cached ? "是" : "否"} />
             <DebugField label="错误" value={debugLog.error ?? "无"} />
+            <DebugField label="网络错误类型" value={debugLog.networkErrorName ?? "无"} />
             <DebugBlock label="完整日志" value={formatFullDebugLog(debugLog)} />
           </div>
         ) : (
@@ -220,15 +240,22 @@ function formatFullDebugLog(debugLog: DebugLog): string {
         mode: debugLog.mode,
         model: debugLog.model,
         baseUrl: debugLog.baseUrl,
+        requestUrl: debugLog.requestUrl,
         hasApiKey: debugLog.hasApiKey,
+        hostPermissionGranted: debugLog.hostPermissionGranted,
         difficulty: debugLog.difficulty,
         concentration: debugLog.concentration,
         coverage: debugLog.coverage,
+        sourceChunkCount: debugLog.sourceChunkCount,
+        selectedChunkCount: debugLog.chunks.length,
         httpStatus: debugLog.httpStatus,
         parsedCount: debugLog.parsedCount,
         sanitizedCount: debugLog.sanitizedCount,
+        batchStatuses: debugLog.batchStatuses,
         cached: debugLog.cached,
-        error: debugLog.error
+        error: debugLog.error,
+        networkErrorName: debugLog.networkErrorName,
+        networkErrorDetails: debugLog.networkErrorDetails
       },
       chunks: debugLog.chunks,
       rawResponse: debugLog.rawResponse || ""

@@ -90,7 +90,7 @@ function App() {
       <section className="meta">
         <span>难度 {settings.difficulty}</span>
         <span>浓度 {settings.concentration}</span>
-        <span>范围 {settings.coverage}</span>
+        <span>覆盖 {settings.coverage}</span>
       </section>
 
       <button className="primary" disabled={busy} onClick={runRewrite}>

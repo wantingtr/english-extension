@@ -17,17 +17,21 @@ type RewriteReplacement = {
 type RewriteResponse = {
   replacements: RewriteReplacement[];
   cached: boolean;
+  streamed?: boolean;
   error?: string;
 };
 
 const PROCESSED_ATTR = "data-english-immersion";
 const MIN_TEXT_LENGTH = 18;
-const COVERAGE_LIMITS: Record<number, { chunks: number; chars: number }> = {
-  1: { chunks: 6, chars: 1800 },
-  2: { chunks: 10, chars: 3000 },
-  3: { chunks: 14, chars: 4300 },
-  4: { chunks: 18, chars: 5600 },
-  5: { chunks: 24, chars: 7600 }
+const MAX_TEXT_CHUNKS = 160;
+const MAX_TEXT_CHARS = 50_000;
+const PRIORITY_CHUNK_COUNT = 24;
+const COVERAGE_SAMPLE_RATES: Record<number, number> = {
+  1: 0.12,
+  2: 0.22,
+  3: 0.4,
+  4: 0.6,
+  5: 0.8
 };
 const chunkNodes = new Map<string, Text>();
 
@@ -52,38 +56,64 @@ async function runRewrite(mode: RewriteMode, coverage: number) {
   injectStyles();
   chunkNodes.clear();
 
-  const chunks = collectTextChunks(coverage);
-  if (!chunks.length) {
+  const allChunks = collectTextChunks();
+  if (!allChunks.length) {
     throw new Error("没有找到适合改造的正文内容。");
   }
 
-  const resolvedMode = mode === "auto" ? detectMode(chunks) : mode;
-  const response = (await chrome.runtime.sendMessage({
-    type: "REWRITE_PAGE",
-    payload: {
-      url: location.href,
-      title: document.title,
-      mode: resolvedMode,
-      chunks
+  const chunks = selectChunksForRewrite(allChunks, coverage);
+  const resolvedMode = mode === "auto" ? detectMode(allChunks) : mode;
+  const requestId = crypto.randomUUID();
+  let streamedApplied = 0;
+
+  const batchListener = (message: {
+    type?: string;
+    requestId?: string;
+    replacements?: RewriteReplacement[];
+  }) => {
+    if (message?.type !== "IMMERSION_BATCH_RESULT" || message.requestId !== requestId) {
+      return false;
     }
-  })) as RewriteResponse;
+    streamedApplied += applyReplacements(message.replacements ?? []);
+    return false;
+  };
+
+  chrome.runtime.onMessage.addListener(batchListener);
+  let response: RewriteResponse;
+  try {
+    response = (await chrome.runtime.sendMessage({
+      type: "REWRITE_PAGE",
+      payload: {
+        requestId,
+        url: location.href,
+        title: document.title,
+        mode: resolvedMode,
+        chunks,
+        sourceChunkCount: allChunks.length
+      }
+    })) as RewriteResponse;
+  } finally {
+    chrome.runtime.onMessage.removeListener(batchListener);
+  }
 
   if (response.error) {
     throw new Error(response.error);
   }
 
-  const applied = applyReplacements(response.replacements ?? []);
+  const applied = response.streamed
+    ? streamedApplied + applyReplacements(response.replacements ?? [])
+    : applyReplacements(response.replacements ?? []);
   return {
     ok: true,
     mode: resolvedMode,
     chunks: chunks.length,
+    sourceChunks: allChunks.length,
     applied,
     cached: response.cached
   };
 }
 
-function collectTextChunks(coverage: number): TextChunk[] {
-  const limits = COVERAGE_LIMITS[clampCoverage(coverage)];
+function collectTextChunks(): TextChunk[] {
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (!(node instanceof Text)) {
@@ -101,7 +131,7 @@ function collectTextChunks(coverage: number): TextChunk[] {
   let totalChars = 0;
   let index = 0;
 
-  while (walker.nextNode() && chunks.length < limits.chunks && totalChars < limits.chars) {
+  while (walker.nextNode() && chunks.length < MAX_TEXT_CHUNKS && totalChars < MAX_TEXT_CHARS) {
     const node = walker.currentNode as Text;
     const text = normalizeText(node.nodeValue ?? "");
 
@@ -117,6 +147,42 @@ function collectTextChunks(coverage: number): TextChunk[] {
   }
 
   return chunks;
+}
+
+function selectChunksForRewrite(chunks: TextChunk[], coverage: number): TextChunk[] {
+  if (chunks.length <= PRIORITY_CHUNK_COUNT) {
+    return chunks;
+  }
+
+  const priority = chunks.slice(0, PRIORITY_CHUNK_COUNT);
+  const rest = chunks.slice(PRIORITY_CHUNK_COUNT);
+  const rate = COVERAGE_SAMPLE_RATES[clampCoverage(coverage)];
+  const sampleCount = Math.min(rest.length, Math.ceil(rest.length * rate));
+  const sampled = evenlySample(rest, sampleCount);
+
+  return [...priority, ...sampled];
+}
+
+function evenlySample<T>(items: T[], count: number): T[] {
+  if (count <= 0) {
+    return [];
+  }
+  if (count >= items.length) {
+    return items;
+  }
+
+  const sampled: T[] = [];
+  const usedIndexes = new Set<number>();
+
+  for (let index = 0; index < count; index += 1) {
+    const itemIndex = Math.min(items.length - 1, Math.floor(((index + 0.5) * items.length) / count));
+    if (!usedIndexes.has(itemIndex)) {
+      usedIndexes.add(itemIndex);
+      sampled.push(items[itemIndex]);
+    }
+  }
+
+  return sampled;
 }
 
 function clampCoverage(value: number): number {

@@ -25,13 +25,16 @@ export type RewriteReplacement = {
 };
 
 export type RewriteRequest = {
+  requestId?: string;
   url: string;
   title: string;
   mode: ResolvedRewriteMode;
   chunks: TextChunk[];
+  sourceChunkCount?: number;
 };
 
 export type RewriteResponse = {
   replacements: RewriteReplacement[];
   cached: boolean;
+  streamed?: boolean;
 };

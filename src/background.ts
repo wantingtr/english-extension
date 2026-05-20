@@ -28,31 +28,51 @@ type DebugLog = {
   mode: RewriteRequest["mode"];
   model: string;
   baseUrl: string;
+  requestUrl?: string;
   hasApiKey: boolean;
+  hostPermissionGranted?: boolean;
   difficulty: number;
   concentration: number;
   coverage: number;
+  sourceChunkCount?: number;
   chunks: Array<{ id: string; text: string }>;
   httpStatus?: number;
   rawResponse?: string;
   parsedCount?: number;
   sanitizedCount?: number;
   cached?: boolean;
+  batchStatuses?: BatchStatus[];
+  error?: string;
+  networkErrorName?: string;
+  networkErrorDetails?: string;
+};
+
+type BatchStatus = {
+  index: number;
+  chunkIds: string[];
+  elapsedMs?: number;
+  httpStatus?: number;
+  parsedCount?: number;
+  sanitizedCount?: number;
   error?: string;
 };
 
 const CACHE_PREFIX = "rewriteCache:";
-const MAX_REPLACEMENTS = 36;
+const MAX_REPLACEMENTS = 96;
 const DEBUG_CHUNK_TEXT_LIMIT = 240;
 const DEBUG_RAW_RESPONSE_LIMIT = 12000;
-const PROMPT_VERSION = "selection-protocol-v3";
+const PROMPT_VERSION = "selection-protocol-v4-streaming-fullscan";
+const REQUEST_TIMEOUT_MS = 12_000;
+const CHUNKS_PER_AI_REQUEST = 4;
+const MAX_PARALLEL_AI_REQUESTS = 1;
+const MAX_SELECTIONS_PER_AI_REQUEST = 8;
 
-chrome.runtime.onMessage.addListener((message: RewriteMessage, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: RewriteMessage, sender, sendResponse) => {
   if (message?.type !== "REWRITE_PAGE") {
     return false;
   }
 
-  handleRewrite(message.payload)
+  handleRewrite(message.payload, sender)
     .then(sendResponse)
     .catch((error: unknown) => {
       sendResponse({
@@ -63,7 +83,7 @@ chrome.runtime.onMessage.addListener((message: RewriteMessage, _sender, sendResp
   return true;
 });
 
-async function handleRewrite(request: RewriteRequest): Promise<RewriteResponse> {
+async function handleRewrite(request: RewriteRequest, sender: chrome.runtime.MessageSender): Promise<RewriteResponse> {
   const settings = await getSettings();
   const debugLog = createBaseDebugLog(request, settings);
 
@@ -83,17 +103,18 @@ async function handleRewrite(request: RewriteRequest): Promise<RewriteResponse> 
       parsedCount: cachedValue.replacements.length,
       sanitizedCount: cachedValue.replacements.length
     });
-    return { ...cachedValue, cached: true };
+    return { ...cachedValue, cached: true, streamed: false };
   }
 
-  const replacements = await rewriteWithSiliconFlow(request, settings, debugLog);
-  const response: RewriteResponse = {
+  const replacements = await rewriteWithSiliconFlow(request, settings, debugLog, sender);
+  const cachedResponse: RewriteResponse = {
     replacements: replacements.slice(0, MAX_REPLACEMENTS),
-    cached: false
+    cached: false,
+    streamed: false
   };
 
-  await chrome.storage.local.set({ [cacheKey]: response });
-  return response;
+  await chrome.storage.local.set({ [cacheKey]: cachedResponse });
+  return { ...cachedResponse, streamed: Boolean(request.requestId) };
 }
 
 async function getSettings(): Promise<Settings> {
@@ -123,23 +144,121 @@ async function buildCacheKey(request: RewriteRequest, settings: Settings): Promi
 async function rewriteWithSiliconFlow(
   request: RewriteRequest,
   settings: Settings,
-  debugLog: DebugLog
+  debugLog: DebugLog,
+  sender: chrome.runtime.MessageSender
 ): Promise<RewriteReplacement[]> {
+  const completionUrl = buildCompletionUrl(settings.baseUrl);
+
   try {
-    const response = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    debugLog.requestUrl = completionUrl;
+    debugLog.hostPermissionGranted = await hasHostPermission(completionUrl);
+
+    if (!debugLog.hostPermissionGranted) {
+      throw new Error(`扩展没有访问 ${new URL(completionUrl).origin} 的权限，请重新构建并重新加载插件。`);
+    }
+
+    const batches = chunkArray(request.chunks, CHUNKS_PER_AI_REQUEST);
+    const selections: AiSelection[] = [];
+    const replacements: RewriteReplacement[] = [];
+    const rawResponses: string[] = Array.from({ length: batches.length }, () => "");
+    debugLog.batchStatuses = batches.map((chunks, index) => ({
+      index: index + 1,
+      chunkIds: chunks.map((chunk) => chunk.id)
+    }));
+
+    for (let start = 0; start < batches.length; start += MAX_PARALLEL_AI_REQUESTS) {
+      const wave = batches.slice(start, start + MAX_PARALLEL_AI_REQUESTS);
+      await Promise.all(
+        wave.map(async (chunks, waveIndex) => {
+          const index = start + waveIndex;
+          const batchRequest = { ...request, chunks };
+          const status = debugLog.batchStatuses?.[index];
+          if (!status) {
+            return;
+          }
+          const startedAt = Date.now();
+
+          try {
+            const content = await fetchModelContent(completionUrl, batchRequest, settings, status);
+            status.elapsedMs = Date.now() - startedAt;
+            rawResponses[index] = `Batch ${status.index}: ${content}`;
+            debugLog.rawResponse = rawResponses.filter(Boolean).join("\n\n").slice(0, DEBUG_RAW_RESPONSE_LIMIT);
+            await saveDebugLog(debugLog);
+
+            const batchSelections = parseModelSelections(content);
+            status.parsedCount = batchSelections.length;
+            const batchReplacements = selectionsToReplacements(batchSelections, batchRequest, settings);
+            status.sanitizedCount = batchReplacements.length;
+            selections.push(...batchSelections);
+            replacements.push(...batchReplacements);
+            await emitBatchResult(request, sender, status.index, batchReplacements);
+            await saveDebugLog(debugLog);
+          } catch (error) {
+            status.elapsedMs = Date.now() - startedAt;
+            status.error = error instanceof Error ? normalizeFetchError(error) : "改写失败，请稍后重试。";
+            await saveDebugLog(debugLog);
+            if (!isRecoverableBatchError(error)) {
+              throw error;
+            }
+          }
+        })
+      );
+
+    }
+
+    debugLog.httpStatus = debugLog.batchStatuses.at(-1)?.httpStatus;
+    debugLog.rawResponse = rawResponses.filter(Boolean).join("\n\n").slice(0, DEBUG_RAW_RESPONSE_LIMIT);
+    debugLog.parsedCount = selections.length;
+    debugLog.sanitizedCount = replacements.length;
+    if (!replacements.length) {
+      const firstBatchError = debugLog.batchStatuses.find((status) => status.error)?.error;
+      if (firstBatchError) {
+        throw new Error(firstBatchError);
+      }
+    }
+    await saveDebugLog(debugLog);
+    return replacements.slice(0, MAX_REPLACEMENTS);
+  } catch (error) {
+    if (error instanceof Error) {
+      debugLog.networkErrorName = error.name;
+      debugLog.networkErrorDetails = error.stack?.slice(0, 2000) ?? error.message;
+      debugLog.error = normalizeFetchError(error);
+    } else {
+      debugLog.error = "改写失败，请稍后重试。";
+      debugLog.networkErrorDetails = String(error);
+    }
+    await saveDebugLog(debugLog);
+    throw error;
+  }
+}
+
+async function fetchModelContent(
+  completionUrl: string,
+  request: RewriteRequest,
+  settings: Settings,
+  batchStatus: BatchStatus
+): Promise<string> {
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(completionUrl, {
       method: "POST",
+      signal: abortController.signal,
       headers: {
         Authorization: `Bearer ${settings.apiKey.trim()}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
         model: settings.model,
-        temperature: 0.1,
-        max_tokens: 1800,
+        temperature: 0,
+        top_p: 0.8,
+        max_tokens: 700,
+        response_format: { type: "json_object" },
         messages: [
           {
             role: "system",
-            content: buildSystemPrompt(request.mode, settings)
+            content: buildSystemPrompt(request.mode, settings, getMaxSelectionsPerRequest(settings.coverage))
           },
           {
             role: "user",
@@ -152,7 +271,7 @@ async function rewriteWithSiliconFlow(
       })
     });
 
-    debugLog.httpStatus = response.status;
+    batchStatus.httpStatus = response.status;
 
     if (!response.ok) {
       if (response.status === 401) {
@@ -168,26 +287,101 @@ async function rewriteWithSiliconFlow(
       choices?: Array<{ message?: { content?: string } }>;
     };
     const content = data.choices?.[0]?.message?.content?.trim();
-    debugLog.rawResponse = content?.slice(0, DEBUG_RAW_RESPONSE_LIMIT) ?? "";
 
     if (!content) {
       throw new Error("模型没有返回候选片段。");
     }
 
-    const selections = parseModelSelections(content);
-    debugLog.parsedCount = selections.length;
-    const replacements = selectionsToReplacements(selections, request, settings);
-    debugLog.sanitizedCount = replacements.length;
-    await saveDebugLog(debugLog);
-    return replacements;
-  } catch (error) {
-    debugLog.error = error instanceof Error ? error.message : "改写失败，请稍后重试。";
-    await saveDebugLog(debugLog);
-    throw error;
+    return content;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
-function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings): string {
+function normalizeFetchError(error: Error): string {
+  if (error.name === "AbortError") {
+    return "单批请求超时，已跳过该批并继续处理其它内容。";
+  }
+  if (error.message === "Failed to fetch") {
+    return "无法连接到 AI API。请检查网络、代理、Base URL，或重新加载已构建的插件。";
+  }
+  return error.message;
+}
+
+function isRecoverableBatchError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "AbortError" ||
+      error.message === "Failed to fetch" ||
+      error.message.includes("候选 JSON 无法解析"))
+  );
+}
+
+function chunkArray<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function getMaxSelectionsPerRequest(coverage: number): number {
+  const normalizedCoverage = Math.min(5, Math.max(1, Math.round(coverage)));
+  const values: Record<number, number> = {
+    1: 1,
+    2: 2,
+    3: 4,
+    4: 6,
+    5: MAX_SELECTIONS_PER_AI_REQUEST
+  };
+  return values[normalizedCoverage];
+}
+
+async function emitBatchResult(
+  request: RewriteRequest,
+  sender: chrome.runtime.MessageSender,
+  batchIndex: number,
+  replacements: RewriteReplacement[]
+): Promise<void> {
+  if (!request.requestId || !sender.tab?.id || !replacements.length) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    chrome.tabs.sendMessage(
+      sender.tab!.id!,
+      {
+        type: "IMMERSION_BATCH_RESULT",
+        requestId: request.requestId,
+        batchIndex,
+        replacements
+      },
+      () => {
+        void chrome.runtime.lastError;
+        resolve();
+      }
+    );
+  });
+}
+
+function buildCompletionUrl(baseUrl: string): string {
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+  if (!normalizedBaseUrl) {
+    throw new Error("Base URL 不能为空。");
+  }
+  return `${normalizedBaseUrl}/chat/completions`;
+}
+
+async function hasHostPermission(url: string): Promise<boolean> {
+  try {
+    const origin = new URL(url).origin;
+    return await chrome.permissions.contains({ origins: [`${origin}/*`] });
+  } catch {
+    return false;
+  }
+}
+
+function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, maxSelections: number): string {
   const difficultyMap: Record<number, string> = {
     1: "小学到初中，选择最常见、最基础的词汇和短语。",
     2: "高中水平，选择常见生活、学习、工作表达。",
@@ -212,13 +406,13 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings): st
           "避免选择只能用于当前页面的唯一标识信息，例如专有名词、具体名称、编号、价格、日期、距离、面积、地址、联系方式。",
           "如果一个片段混合了唯一标识信息和通用表达，只选择其中可迁移的通用表达。",
           "en 要自然、可复用，优先翻译成英文里真实会使用的词组；不要逐字硬翻，也不要把整句写成完整英文句子。",
-          "每个有内容价值的 chunk 尽量选择 2-4 个候选。禁止选择整段长句。"
+          "每个 chunk 最多选择 2 个候选。禁止选择整段长句。"
         ].join("\n")
       : [
           "处理英文网页。你只负责选择适合解释的英文原文片段并给中文释义，不要生成最终替换文本。",
           "quote 必须从 chunk 原文中逐字复制，不能改字、漏字、加空格、改标点或修正原文。",
           "zh 只写中文释义，不要重复 quote。本地程序会生成 quote(zh)。",
-          "优先选择难词、短语、短表达，禁止选择整段长句。"
+          "每个 chunk 最多选择 2 个候选。优先选择难词、短语、短表达，禁止选择整段长句。"
         ].join("\n");
 
   return [
@@ -226,7 +420,8 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings): st
     modeTask,
     `英语难度：${settings.difficulty} 档，${difficultyMap[settings.difficulty]}`,
     `替换浓度：${settings.concentration} 档，${concentrationMap[settings.concentration]}`,
-    `替换范围：${settings.coverage} 档。范围只影响输入正文数量，不代表可以选择整段。`,
+    `覆盖密度：${settings.coverage} 档。页面会全文扫描；该档位只控制每批候选数量和替换积极程度，不允许选择整段凑数。`,
+    `本次最多返回 ${maxSelections} 个 selection。宁可少选，也不要补无价值候选。`,
     "严格输出：",
     '1. 只返回 JSON，不要 Markdown，不要代码块，不要解释。格式：{"selections":[...]}',
     "2. 每个 selection 必须包含 chunkId、quote、start、end、type、level、isProperNoun、isTransferable、learningValue。",
@@ -241,12 +436,13 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings): st
       ? "8. 中文 quote 优先 2-10 个汉字，最多不要超过 16 个汉字；除非浓度为 5，否则不要选 sentence。"
       : "8. 英文 quote 优先 1-6 个英文词，不要整段解释。",
     mode === "zh-to-en"
-      ? "9. 中文模式每个有内容价值的 chunk 尽量选择 2-4 个 selection，整次最多 36 个；只选择 isTransferable=true 且 learningValue>=3 的候选。"
-      : "9. 英文模式每个有内容价值的 chunk 选择 1-4 个 selection，整次最多 36 个。",
+      ? `9. 中文模式每个 chunk 选择 0-2 个 selection，本次总数不得超过 ${maxSelections}；只选择 isTransferable=true 且 learningValue>=3 的候选。`
+      : `9. 英文模式每个 chunk 选择 0-2 个 selection，本次总数不得超过 ${maxSelections}。`,
     "10. 不要选择 isProperNoun=true 的候选，不要选择数字、日期、URL、代码、价格。",
+    '11. 如果没有合适候选，返回 {"selections":[]}。',
     mode === "zh-to-en"
-      ? '11. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"原文片段","start":0,"end":4,"en":"natural English","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
-      : '11. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"source phrase","start":0,"end":13,"zh":"中文释义","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
+      ? '12. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"原文片段","start":0,"end":4,"en":"natural English","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
+      : '12. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"source phrase","start":0,"end":13,"zh":"中文释义","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
   ].join("\n");
 }
 
@@ -664,6 +860,7 @@ function createBaseDebugLog(request: RewriteRequest, settings: Settings): DebugL
     difficulty: settings.difficulty,
     concentration: settings.concentration,
     coverage: settings.coverage,
+    sourceChunkCount: request.sourceChunkCount,
     chunks: request.chunks.map((chunk) => ({
       id: chunk.id,
       text:

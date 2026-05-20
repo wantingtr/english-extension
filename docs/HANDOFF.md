@@ -9,7 +9,7 @@
 - 中文网页改造：从中文正文中选择可迁移、高频、有学习价值的片段，替换成 `English(中文原文)`。
 - 英文网页改造：从英文正文中选择需要解释的难词或短语，替换成 `English(中文释义)`。
 - 手动触发：通过 popup 点击“改造当前页面”。
-- 设置项：硅基流动 API key、base URL、模型名、英文难度、替换浓度、替换范围。
+- 设置项：硅基流动 API key、base URL、模型名、英文难度、替换浓度、覆盖密度。
 - 调试面板：options 页面底部展示完整日志，方便跨设备复制给 Codex。
 
 构建验证命令：
@@ -31,8 +31,8 @@ Chrome 加载路径：
 
 主要文件：
 
-- `src/content.ts`：提取正文 chunks、接收 popup 指令、执行 DOM 替换、注入青绿色下划线样式。
-- `src/background.ts`：读取设置、调用硅基流动、解析 AI selections、校验 quote、生成最终 replacements、写入调试日志和页面级缓存。
+- `src/content.ts`：全文扫描正文 chunks、按覆盖密度选择请求 chunks、接收 popup 指令、流式应用批次结果、注入青绿色下划线样式。
+- `src/background.ts`：读取设置、分批调用硅基流动、解析 AI selections、校验 quote、生成最终 replacements、把每批成功结果回推给页面、写入调试日志和页面级缓存。
 - `src/popup/main.tsx`：模式选择、手动触发当前页改造、显示处理状态。
 - `src/options/main.tsx`：API 和学习参数设置、完整调试日志。
 - `src/sharedDefaults.ts`：默认设置和 storage key。
@@ -68,7 +68,44 @@ AI 应返回：
 - 中文模式本地生成最终替换：`${en}(${quote})`。
 - 英文模式本地生成最终替换：`${quote}(${zh})`。
 - 本地不再维护手写词典、租房词表、地名黑名单或个人词典缓存。
-- 当前只保留页面级缓存：同 URL、chunks、模式、模型、难度、浓度、范围、prompt version 下复用上次 replacements。
+- 当前只保留页面级缓存：同 URL、被选中请求 chunks、模式、模型、难度、浓度、覆盖密度、prompt version 下复用上次 replacements。
+
+## 当前请求策略
+
+当前 prompt version 是 `selection-protocol-v4-streaming-fullscan`。
+
+页面处理流程：
+
+1. content script 从 DOM 从上到下全文扫描可用正文，最多收集 `160` 个 chunk / `50,000` 字符作为安全上限。
+2. 顶部 `24` 个 chunk 必选，保证用户从上往下阅读时前几屏优先出现结果。
+3. 顶部之后的正文按覆盖密度做确定性的均匀抽样，不做随机抽样，确保缓存稳定。
+4. 选中的 chunk 每 `4` 个组成一个 batch。
+5. background 串行请求 LLM，当前并发数为 `1`。
+6. 单批请求最多等待 `12s`；超时、`Failed to fetch`、候选 JSON 解析失败都视为可恢复批次错误，跳过该批并继续下一批。
+7. 每批成功后，background 通过 `IMMERSION_BATCH_RESULT` 立即发回当前 tab，content script 立刻替换对应 DOM，不再等整页全部完成。
+8. 所有批次结束后写入页面级缓存；命中缓存时仍一次性应用缓存结果。
+
+覆盖密度当前语义：
+
+```text
+1 档：顶部优先，后文抽样约 12%，每批最多 1 个 selection
+2 档：顶部优先，后文抽样约 22%，每批最多 2 个 selections
+3 档：顶部优先，后文抽样约 40%，每批最多 4 个 selections
+4 档：顶部优先，后文抽样约 60%，每批最多 6 个 selections
+5 档：顶部优先，后文抽样约 80%，每批最多 8 个 selections
+```
+
+真实 LatePost 验证记录：
+
+```text
+URL: https://www.latepost.com/news/dj_detail?id=3558
+全文扫描: 122 chunks
+覆盖密度 3 档实际请求: 64 chunks
+请求批次: 16 batches
+旧全文全送策略: 122 chunks / 31 batches
+```
+
+测试产物在本地 `output/`，已加入 `.gitignore`，不要提交大截图或日志。
 
 ## 设计决策
 
@@ -106,6 +143,8 @@ AI 的职责：
 - AI 有时生成不自然表达，例如把短语翻成完整句。
 - 替换数量偏少，尤其当 `isProperNoun/isTransferable/learningValue` 字段判断偏保守时。
 - 页面级缓存可能复用旧 prompt 结果；每次大幅调整 prompt 后应升级 `PROMPT_VERSION`。
+- SiliconFlow 当前响应非常不稳定，真实测试中大量 batch 会卡到 `12s` 超时。现有代码已降低请求量并支持流式应用，但 API 慢仍会影响整页完成时间。
+- 当前是串行请求，用户体验比全页等待好，但总耗时仍受超时批次数影响。
 
 当前通用过滤策略在 `src/background.ts`：
 
@@ -136,6 +175,8 @@ AI 的职责：
 
 - 在调试日志里加入 `acceptedSelections` 和 `rejectedSelections`，记录每条被拒原因。
 - popup 显示“AI 候选 N，最终替换 M”，便于判断是模型少选还是本地过滤太严。
+- popup 增加进度状态，例如“已完成 4/16 批，已替换 12 处”，让用户知道不是卡死。
+- 可以尝试并发 `2`、单批 timeout `8-10s`，但需要用真实 SiliconFlow 压测，避免供应商限流或更多超时。
 
 优先级 4：英文网页模式。
 
@@ -153,11 +194,27 @@ AI 的职责：
 
 重点看：
 
-- `chunks`：正文提取是否正确。
+- `sourceChunkCount`：全文扫描到多少正文 chunk。
+- `chunks`：实际选中并发送给 LLM 的 chunk 是否合理。
 - `rawResponse`：AI 是否按 selections schema 返回。
 - `parsedCount`：解析到多少候选。
 - `sanitizedCount`：最终接受多少候选。
+- `batchStatuses`：每批 chunk、耗时、HTTP 状态、解析/接受数量、是否超时。
 - `error`：是否有请求、解析或执行错误。
+
+## 自动化测试脚本
+
+当前有几条脚本用于减少手工复制日志：
+
+```bash
+npm run smoke:extension
+npm run real-api:extension -- 'https://www.latepost.com/news/dj_detail?id=3558'
+npm run current:extension -- 'https://www.latepost.com/news/dj_detail?id=3558'
+```
+
+- `smoke:extension`：使用 mock API，适合验证 DOM 替换和基本流程。
+- `real-api:extension`：独立 Playwright Chromium + 真实 SiliconFlow API，适合验证真实接口慢/超时。
+- `current:extension`：尝试控制用户当前 Chrome。当前机器标准 `http://127.0.0.1:9222/json/version` 返回 404，但可通过 `~/Library/Application Support/Google/Chrome/DevToolsActivePort` 读取 websocket 直连。长时间测试后该 websocket 可能握手超时，需要重启调试 Chrome 或改用 `real-api:extension`。
 
 ## Git/远程
 
