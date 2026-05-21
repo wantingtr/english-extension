@@ -18,6 +18,17 @@ type RewriteResponse = {
   replacements: RewriteReplacement[];
   cached: boolean;
   streamed?: boolean;
+  batchTimings?: BatchTiming[];
+  totalElapsedMs?: number;
+  error?: string;
+};
+
+type BatchTiming = {
+  index: number;
+  elapsedMs?: number;
+  httpStatus?: number;
+  parsedCount?: number;
+  sanitizedCount?: number;
   error?: string;
 };
 
@@ -25,13 +36,13 @@ const PROCESSED_ATTR = "data-english-immersion";
 const MIN_TEXT_LENGTH = 18;
 const MAX_TEXT_CHUNKS = 160;
 const MAX_TEXT_CHARS = 50_000;
-const PRIORITY_CHUNK_COUNT = 24;
+const PRIORITY_CHUNK_COUNT = 16;
 const COVERAGE_SAMPLE_RATES: Record<number, number> = {
-  1: 0.12,
-  2: 0.22,
-  3: 0.4,
-  4: 0.6,
-  5: 0.8
+  1: 0.08,
+  2: 0.16,
+  3: 0.28,
+  4: 0.45,
+  5: 0.65
 };
 const chunkNodes = new Map<string, Text>();
 
@@ -40,7 +51,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
-  runRewrite(message.mode as RewriteMode, Number(message.coverage ?? 3))
+  runRewrite(message.mode as RewriteMode, Number(message.coverage ?? 2))
     .then(sendResponse)
     .catch((error: unknown) => {
       sendResponse({
@@ -65,16 +76,46 @@ async function runRewrite(mode: RewriteMode, coverage: number) {
   const resolvedMode = mode === "auto" ? detectMode(allChunks) : mode;
   const requestId = crypto.randomUUID();
   let streamedApplied = 0;
+  const batchTimings: BatchTiming[] = [];
 
   const batchListener = (message: {
     type?: string;
     requestId?: string;
+    batchIndex?: number;
+    totalBatches?: number;
+    elapsedMs?: number;
+    httpStatus?: number;
+    parsedCount?: number;
+    sanitizedCount?: number;
+    error?: string;
     replacements?: RewriteReplacement[];
   }) => {
     if (message?.type !== "IMMERSION_BATCH_RESULT" || message.requestId !== requestId) {
       return false;
     }
-    streamedApplied += applyReplacements(message.replacements ?? []);
+    const applied = applyReplacements(message.replacements ?? []);
+    streamedApplied += applied;
+    batchTimings.push({
+      index: Number(message.batchIndex ?? batchTimings.length + 1),
+      elapsedMs: message.elapsedMs,
+      httpStatus: message.httpStatus,
+      parsedCount: message.parsedCount,
+      sanitizedCount: message.sanitizedCount,
+      error: message.error
+    });
+    void chrome.runtime.sendMessage({
+      type: "IMMERSION_RUN_PROGRESS",
+      requestId,
+      batchIndex: message.batchIndex,
+      totalBatches: message.totalBatches,
+      elapsedMs: message.elapsedMs,
+      httpStatus: message.httpStatus,
+      parsedCount: message.parsedCount,
+      sanitizedCount: message.sanitizedCount,
+      applied,
+      totalApplied: streamedApplied,
+      error: message.error
+    });
     return false;
   };
 
@@ -109,7 +150,9 @@ async function runRewrite(mode: RewriteMode, coverage: number) {
     chunks: chunks.length,
     sourceChunks: allChunks.length,
     applied,
-    cached: response.cached
+    cached: response.cached,
+    batchTimings: response.batchTimings ?? batchTimings,
+    totalElapsedMs: response.totalElapsedMs
   };
 }
 

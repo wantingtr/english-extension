@@ -1,5 +1,5 @@
-import { DEBUG_LOG_KEY, DEFAULT_SETTINGS, SETTINGS_KEY } from "./sharedDefaults";
-import type { RewriteReplacement, RewriteRequest, RewriteResponse, Settings } from "./types";
+import { DEBUG_LOG_KEY, SETTINGS_KEY, normalizeSettings } from "./sharedDefaults";
+import type { BatchTiming, RewriteReplacement, RewriteRequest, RewriteResponse, Settings } from "./types";
 
 type RewriteMessage = {
   type: "REWRITE_PAGE";
@@ -55,13 +55,14 @@ type BatchStatus = {
   parsedCount?: number;
   sanitizedCount?: number;
   error?: string;
+  rawResponse?: string;
 };
 
 const CACHE_PREFIX = "rewriteCache:";
 const MAX_REPLACEMENTS = 96;
 const DEBUG_CHUNK_TEXT_LIMIT = 240;
 const DEBUG_RAW_RESPONSE_LIMIT = 12000;
-const PROMPT_VERSION = "selection-protocol-v4-streaming-fullscan";
+const PROMPT_VERSION = "selection-protocol-v6-word-first-concentration";
 const REQUEST_TIMEOUT_MS = 12_000;
 const CHUNKS_PER_AI_REQUEST = 4;
 const MAX_PARALLEL_AI_REQUESTS = 1;
@@ -88,8 +89,8 @@ async function handleRewrite(request: RewriteRequest, sender: chrome.runtime.Mes
   const debugLog = createBaseDebugLog(request, settings);
 
   if (!settings.apiKey.trim()) {
-    await saveDebugLog({ ...debugLog, error: "还没有填写硅基流动 API key，请先打开设置页填写。" });
-    throw new Error("还没有填写硅基流动 API key，请先打开设置页填写。");
+    await saveDebugLog({ ...debugLog, error: "还没有填写 DeepSeek API key，请先打开设置页填写。" });
+    throw new Error("还没有填写 DeepSeek API key，请先打开设置页填写。");
   }
 
   const cacheKey = await buildCacheKey(request, settings);
@@ -106,11 +107,14 @@ async function handleRewrite(request: RewriteRequest, sender: chrome.runtime.Mes
     return { ...cachedValue, cached: true, streamed: false };
   }
 
-  const replacements = await rewriteWithSiliconFlow(request, settings, debugLog, sender);
+  const startedAt = Date.now();
+  const { replacements, batchTimings } = await rewriteWithDeepSeek(request, settings, debugLog, sender);
   const cachedResponse: RewriteResponse = {
     replacements: replacements.slice(0, MAX_REPLACEMENTS),
     cached: false,
-    streamed: false
+    streamed: false,
+    batchTimings,
+    totalElapsedMs: Date.now() - startedAt
   };
 
   await chrome.storage.local.set({ [cacheKey]: cachedResponse });
@@ -119,10 +123,9 @@ async function handleRewrite(request: RewriteRequest, sender: chrome.runtime.Mes
 
 async function getSettings(): Promise<Settings> {
   const stored = await chrome.storage.local.get(SETTINGS_KEY);
-  return {
-    ...DEFAULT_SETTINGS,
-    ...(stored[SETTINGS_KEY] ?? {})
-  };
+  const settings = normalizeSettings(stored[SETTINGS_KEY] as Partial<Settings> | undefined);
+  await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
+  return settings;
 }
 
 async function buildCacheKey(request: RewriteRequest, settings: Settings): Promise<string> {
@@ -141,12 +144,12 @@ async function buildCacheKey(request: RewriteRequest, settings: Settings): Promi
   return `${CACHE_PREFIX}${hex}`;
 }
 
-async function rewriteWithSiliconFlow(
+async function rewriteWithDeepSeek(
   request: RewriteRequest,
   settings: Settings,
   debugLog: DebugLog,
   sender: chrome.runtime.MessageSender
-): Promise<RewriteReplacement[]> {
+): Promise<{ replacements: RewriteReplacement[]; batchTimings: BatchTiming[] }> {
   const completionUrl = buildCompletionUrl(settings.baseUrl);
 
   try {
@@ -191,12 +194,13 @@ async function rewriteWithSiliconFlow(
             status.sanitizedCount = batchReplacements.length;
             selections.push(...batchSelections);
             replacements.push(...batchReplacements);
-            await emitBatchResult(request, sender, status.index, batchReplacements);
+            await emitBatchResult(request, sender, status, batchReplacements, batches.length);
             await saveDebugLog(debugLog);
           } catch (error) {
             status.elapsedMs = Date.now() - startedAt;
             status.error = error instanceof Error ? normalizeFetchError(error) : "改写失败，请稍后重试。";
             await saveDebugLog(debugLog);
+            await emitBatchResult(request, sender, status, [], batches.length);
             if (!isRecoverableBatchError(error)) {
               throw error;
             }
@@ -217,7 +221,7 @@ async function rewriteWithSiliconFlow(
       }
     }
     await saveDebugLog(debugLog);
-    return replacements.slice(0, MAX_REPLACEMENTS);
+    return { replacements: replacements.slice(0, MAX_REPLACEMENTS), batchTimings: getBatchTimings(debugLog.batchStatuses) };
   } catch (error) {
     if (error instanceof Error) {
       debugLog.networkErrorName = error.name;
@@ -251,9 +255,9 @@ async function fetchModelContent(
       },
       body: JSON.stringify({
         model: settings.model,
+        thinking: { type: "disabled" },
         temperature: 0,
-        top_p: 0.8,
-        max_tokens: 700,
+        max_tokens: 900,
         response_format: { type: "json_object" },
         messages: [
           {
@@ -272,24 +276,34 @@ async function fetchModelContent(
     });
 
     batchStatus.httpStatus = response.status;
+    const rawResponse = await response.text();
+    batchStatus.rawResponse = rawResponse.slice(0, 4000);
 
     if (!response.ok) {
       if (response.status === 401) {
-        throw new Error("硅基流动 API key 无效或没有权限。");
+        throw new Error("DeepSeek API key 无效或没有权限。");
       }
       if (response.status === 429) {
-        throw new Error("硅基流动请求过于频繁或额度不足。");
+        throw new Error("DeepSeek 请求过于频繁或额度不足。");
       }
-      throw new Error(`硅基流动请求失败：HTTP ${response.status}`);
+      throw new Error(`DeepSeek 请求失败：HTTP ${response.status}`);
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
+    let data: {
+      choices?: Array<{ finish_reason?: string; message?: { content?: string | null; reasoning_content?: string | null } }>;
     };
-    const content = data.choices?.[0]?.message?.content?.trim();
+    try {
+      data = JSON.parse(rawResponse) as typeof data;
+    } catch {
+      throw new Error("DeepSeek 返回了无法解析的 JSON 响应。");
+    }
+
+    const choice = data.choices?.[0];
+    const content = choice?.message?.content?.trim();
 
     if (!content) {
-      throw new Error("模型没有返回候选片段。");
+      const finishReason = choice?.finish_reason ? `，finish_reason=${choice.finish_reason}` : "";
+      throw new Error(`模型没有返回候选片段${finishReason}。DeepSeek JSON 模式偶发空 content，请重试；完整响应已写入调试日志。`);
     }
 
     return content;
@@ -313,6 +327,7 @@ function isRecoverableBatchError(error: unknown): boolean {
     error instanceof Error &&
     (error.name === "AbortError" ||
       error.message === "Failed to fetch" ||
+      error.message.includes("没有返回候选片段") ||
       error.message.includes("候选 JSON 无法解析"))
   );
 }
@@ -340,10 +355,11 @@ function getMaxSelectionsPerRequest(coverage: number): number {
 async function emitBatchResult(
   request: RewriteRequest,
   sender: chrome.runtime.MessageSender,
-  batchIndex: number,
-  replacements: RewriteReplacement[]
+  status: BatchStatus,
+  replacements: RewriteReplacement[],
+  totalBatches: number
 ): Promise<void> {
-  if (!request.requestId || !sender.tab?.id || !replacements.length) {
+  if (!request.requestId || !sender.tab?.id) {
     return;
   }
 
@@ -353,7 +369,13 @@ async function emitBatchResult(
       {
         type: "IMMERSION_BATCH_RESULT",
         requestId: request.requestId,
-        batchIndex,
+        batchIndex: status.index,
+        totalBatches,
+        elapsedMs: status.elapsedMs,
+        httpStatus: status.httpStatus,
+        parsedCount: status.parsedCount,
+        sanitizedCount: status.sanitizedCount,
+        error: status.error,
         replacements
       },
       () => {
@@ -362,6 +384,17 @@ async function emitBatchResult(
       }
     );
   });
+}
+
+function getBatchTimings(statuses: BatchStatus[] | undefined): BatchTiming[] {
+  return (statuses ?? []).map((status) => ({
+    index: status.index,
+    elapsedMs: status.elapsedMs,
+    httpStatus: status.httpStatus,
+    parsedCount: status.parsedCount,
+    sanitizedCount: status.sanitizedCount,
+    error: status.error
+  }));
 }
 
 function buildCompletionUrl(baseUrl: string): string {
@@ -390,11 +423,18 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, max
     5: "更高阶水平，选择地道表达、抽象词汇和短句。"
   };
   const concentrationMap: Record<number, string> = {
-    1: "候选以 word 为主，少量 phrase，不选 sentence。",
-    2: "候选以 word 为主，搭配少量 phrase。",
+    1: "强制 word 优先，只选单个词或非常短的词组，不选 sentence。",
+    2: "word 优先，至少优先寻找单个词，只有固定搭配或单词无法自然表达时才选 phrase。",
     3: "候选 word 和 phrase 均衡，谨慎选择 sentence。",
     4: "候选以 phrase 为主，可少量选择 sentence。",
     5: "减少 word，更多选择 phrase 和短 sentence。"
+  };
+  const concentrationRuleMap: Record<number, string> = {
+    1: "浓度 1 的硬规则：优先选择单个中文词或 2-4 个汉字的短词，type 应主要为 word；每批最多 1 个 phrase，禁止 sentence。",
+    2: "浓度 2 的硬规则：先在每个 chunk 中寻找单个中文词或 2-4 个汉字的短词，type 应以 word 为主；只有“安全边际、资金拥挤、正反馈”这类固定搭配或单词无法自然学习时才选 phrase；每批 phrase 数量应少于 word。",
+    3: "浓度 3 的规则：word 和 phrase 均衡，只有短句本身很有学习价值时才选 sentence。",
+    4: "浓度 4 的规则：phrase 优先，可以少量选择短 sentence，但仍要避开整段翻译。",
+    5: "浓度 5 的规则：可以更多选择 phrase 和短 sentence，但每个 selection 仍必须短、可迁移、有学习价值。"
   };
   const modeTask =
     mode === "zh-to-en"
@@ -405,7 +445,7 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, max
           "选择原则必须通用：优先选择可迁移到其他语境的高频表达、状态描述、动作表达、关系表达、条件表达、评价表达。",
           "避免选择只能用于当前页面的唯一标识信息，例如专有名词、具体名称、编号、价格、日期、距离、面积、地址、联系方式。",
           "如果一个片段混合了唯一标识信息和通用表达，只选择其中可迁移的通用表达。",
-          "en 要自然、可复用，优先翻译成英文里真实会使用的词组；不要逐字硬翻，也不要把整句写成完整英文句子。",
+          "en 要自然、可复用。浓度 1-2 时优先给单词级英文；浓度 3-5 时才更多使用英文短语。不要逐字硬翻，也不要把整句写成完整英文句子。",
           "每个 chunk 最多选择 2 个候选。禁止选择整段长句。"
         ].join("\n")
       : [
@@ -420,6 +460,7 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, max
     modeTask,
     `英语难度：${settings.difficulty} 档，${difficultyMap[settings.difficulty]}`,
     `替换浓度：${settings.concentration} 档，${concentrationMap[settings.concentration]}`,
+    concentrationRuleMap[settings.concentration],
     `覆盖密度：${settings.coverage} 档。页面会全文扫描；该档位只控制每批候选数量和替换积极程度，不允许选择整段凑数。`,
     `本次最多返回 ${maxSelections} 个 selection。宁可少选，也不要补无价值候选。`,
     "严格输出：",
@@ -433,7 +474,9 @@ function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, max
     "6. 如果不确定下标，也必须保证 quote 在 chunk.text 中精确存在。",
     "7. type 只能是 word、phrase、sentence。",
     mode === "zh-to-en"
-      ? "8. 中文 quote 优先 2-10 个汉字，最多不要超过 16 个汉字；除非浓度为 5，否则不要选 sentence。"
+      ? settings.concentration <= 2
+        ? "8. 中文 quote 在浓度 1-2 时优先 2-4 个汉字的单词或短词，type 优先 word；phrase 必须是固定搭配或强可迁移表达，最多不要超过 8 个汉字；不要选 sentence。"
+        : "8. 中文 quote 优先 2-10 个汉字，最多不要超过 16 个汉字；除非浓度为 5，否则不要选 sentence。"
       : "8. 英文 quote 优先 1-6 个英文词，不要整段解释。",
     mode === "zh-to-en"
       ? `9. 中文模式每个 chunk 选择 0-2 个 selection，本次总数不得超过 ${maxSelections}；只选择 isTransferable=true 且 learningValue>=3 的候选。`

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../sharedDefaults";
+import { DEFAULT_SETTINGS, SETTINGS_KEY, normalizeSettings } from "../sharedDefaults";
 import type { RewriteMode, Settings } from "../types";
 import "./style.css";
 
@@ -10,6 +10,29 @@ type RunResult = {
   chunks?: number;
   applied?: number;
   cached?: boolean;
+  batchTimings?: BatchTiming[];
+  totalElapsedMs?: number;
+  error?: string;
+};
+
+type BatchTiming = {
+  index: number;
+  elapsedMs?: number;
+  httpStatus?: number;
+  parsedCount?: number;
+  sanitizedCount?: number;
+  error?: string;
+};
+
+type ProgressMessage = {
+  type?: string;
+  batchIndex?: number;
+  totalBatches?: number;
+  elapsedMs?: number;
+  httpStatus?: number;
+  parsedCount?: number;
+  sanitizedCount?: number;
+  totalApplied?: number;
   error?: string;
 };
 
@@ -27,8 +50,35 @@ function App() {
 
   useEffect(() => {
     chrome.storage.local.get(SETTINGS_KEY).then((stored) => {
-      setSettings({ ...DEFAULT_SETTINGS, ...(stored[SETTINGS_KEY] ?? {}) });
+      const normalizedSettings = normalizeSettings(stored[SETTINGS_KEY] as Partial<Settings> | undefined);
+      setSettings(normalizedSettings);
+      void chrome.storage.local.set({ [SETTINGS_KEY]: normalizedSettings });
     });
+  }, []);
+
+  useEffect(() => {
+    const listener = (message: ProgressMessage) => {
+      if (message?.type !== "IMMERSION_RUN_PROGRESS") {
+        return false;
+      }
+
+      const batchText =
+        message.batchIndex && message.totalBatches
+          ? `第 ${message.batchIndex}/${message.totalBatches} 批`
+          : "当前批次";
+      const elapsedText = formatDuration(message.elapsedMs);
+      const appliedText = `累计替换 ${message.totalApplied ?? 0} 处`;
+      const parseText =
+        typeof message.parsedCount === "number" && typeof message.sanitizedCount === "number"
+          ? `，候选 ${message.parsedCount}，有效 ${message.sanitizedCount}`
+          : "";
+      const errorText = message.error ? `，${message.error}` : "";
+      setStatus(`${batchText}完成：DeepSeek ${elapsedText}，${appliedText}${parseText}${errorText}`);
+      return false;
+    };
+
+    chrome.runtime.onMessage.addListener(listener);
+    return () => chrome.runtime.onMessage.removeListener(listener);
   }, []);
 
   async function runRewrite() {
@@ -53,7 +103,8 @@ function App() {
 
       const finalMode = result.mode ? modeLabels[result.mode] : modeLabels[mode];
       const cacheText = result.cached ? "，使用缓存" : "";
-      setStatus(`${finalMode}完成：处理 ${result.chunks ?? 0} 段，替换 ${result.applied ?? 0} 处${cacheText}`);
+      const timingText = result.cached ? "" : `，${formatTimingSummary(result.batchTimings, result.totalElapsedMs)}`;
+      setStatus(`${finalMode}完成：处理 ${result.chunks ?? 0} 段，替换 ${result.applied ?? 0} 处${cacheText}${timingText}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "改造失败。";
       setStatus(message.includes("Receiving end does not exist") ? "当前页面不支持插件注入，请刷新页面后重试。" : message);
@@ -101,11 +152,34 @@ function App() {
 
       {!settings.apiKey && (
         <button className="linkButton" onClick={openOptions}>
-          填写硅基流动 API key
+          填写 DeepSeek API key
         </button>
       )}
     </main>
   );
+}
+
+function formatDuration(ms: number | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) {
+    return "耗时未知";
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatTimingSummary(batchTimings: BatchTiming[] | undefined, totalElapsedMs: number | undefined): string {
+  const finished = (batchTimings ?? []).filter((batch) => typeof batch.elapsedMs === "number");
+  if (!finished.length) {
+    return `总耗时 ${formatDuration(totalElapsedMs)}`;
+  }
+
+  const latest = finished.at(-1);
+  const slowest = finished.reduce((max, batch) => ((batch.elapsedMs ?? 0) > (max.elapsedMs ?? 0) ? batch : max), finished[0]);
+  const averageMs = finished.reduce((sum, batch) => sum + (batch.elapsedMs ?? 0), 0) / finished.length;
+  const totalText = totalElapsedMs ? `总耗时 ${formatDuration(totalElapsedMs)}` : `${finished.length} 批`;
+  return `${totalText}，最后一批 ${formatDuration(latest?.elapsedMs)}，最慢 ${formatDuration(slowest.elapsedMs)}，平均 ${formatDuration(averageMs)}`;
 }
 
 function sendTabMessage<T>(tabId: number, message: unknown): Promise<T> {

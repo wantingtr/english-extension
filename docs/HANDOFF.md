@@ -9,7 +9,7 @@
 - 中文网页改造：从中文正文中选择可迁移、高频、有学习价值的片段，替换成 `English(中文原文)`。
 - 英文网页改造：从英文正文中选择需要解释的难词或短语，替换成 `English(中文释义)`。
 - 手动触发：通过 popup 点击“改造当前页面”。
-- 设置项：硅基流动 API key、base URL、模型名、英文难度、替换浓度、覆盖密度。
+- 设置项：DeepSeek API key、base URL、模型名、英文难度、替换浓度、覆盖密度。
 - 调试面板：options 页面底部展示完整日志，方便跨设备复制给 Codex。
 
 构建验证命令：
@@ -31,9 +31,9 @@ Chrome 加载路径：
 
 主要文件：
 
-- `src/content.ts`：全文扫描正文 chunks、按覆盖密度选择请求 chunks、接收 popup 指令、流式应用批次结果、注入青绿色下划线样式。
-- `src/background.ts`：读取设置、分批调用硅基流动、解析 AI selections、校验 quote、生成最终 replacements、把每批成功结果回推给页面、写入调试日志和页面级缓存。
-- `src/popup/main.tsx`：模式选择、手动触发当前页改造、显示处理状态。
+- `src/content.ts`：全文扫描正文 chunks、按覆盖密度选择请求 chunks、接收 popup 指令、流式应用批次结果、向 popup 转发批次进度、注入青绿色下划线样式。
+- `src/background.ts`：读取设置、分批调用 DeepSeek、解析 AI selections、校验 quote、生成最终 replacements、把每批成功结果回推给页面、写入调试日志和页面级缓存。
+- `src/popup/main.tsx`：模式选择、手动触发当前页改造、显示批次耗时/候选数/有效数/累计替换数和最终耗时统计。
 - `src/options/main.tsx`：API 和学习参数设置、完整调试日志。
 - `src/sharedDefaults.ts`：默认设置和 storage key。
 - `src/types.ts`：跨模块共享类型。
@@ -72,12 +72,25 @@ AI 应返回：
 
 ## 当前请求策略
 
-当前 prompt version 是 `selection-protocol-v4-streaming-fullscan`。
+当前 prompt version 是 `selection-protocol-v6-word-first-concentration`。
+
+默认 API 设置：
+
+```text
+baseUrl: https://api.deepseek.com
+model: deepseek-v4-flash
+thinking: disabled
+temperature: 0
+max_tokens: 900
+response_format: json_object
+```
+
+DeepSeek JSON Output 偶发空 `content`。当前策略是不重试：把该批视为可恢复错误，记录 `rawResponse`/耗时/错误，跳过该批并继续后续 chunk。只有所有批次都没有有效替换时，才向用户报错。
 
 页面处理流程：
 
 1. content script 从 DOM 从上到下全文扫描可用正文，最多收集 `160` 个 chunk / `50,000` 字符作为安全上限。
-2. 顶部 `24` 个 chunk 必选，保证用户从上往下阅读时前几屏优先出现结果。
+2. 顶部 `16` 个 chunk 必选，保证用户从上往下阅读时前几屏优先出现结果，同时控制 token 和请求次数。
 3. 顶部之后的正文按覆盖密度做确定性的均匀抽样，不做随机抽样，确保缓存稳定。
 4. 选中的 chunk 每 `4` 个组成一个 batch。
 5. background 串行请求 LLM，当前并发数为 `1`。
@@ -88,21 +101,25 @@ AI 应返回：
 覆盖密度当前语义：
 
 ```text
-1 档：顶部优先，后文抽样约 12%，每批最多 1 个 selection
-2 档：顶部优先，后文抽样约 22%，每批最多 2 个 selections
-3 档：顶部优先，后文抽样约 40%，每批最多 4 个 selections
-4 档：顶部优先，后文抽样约 60%，每批最多 6 个 selections
-5 档：顶部优先，后文抽样约 80%，每批最多 8 个 selections
+1 档：顶部优先，后文抽样约 8%，每批最多 1 个 selection
+2 档：顶部优先，后文抽样约 16%，每批最多 2 个 selections
+3 档：顶部优先，后文抽样约 28%，每批最多 4 个 selections
+4 档：顶部优先，后文抽样约 45%，每批最多 6 个 selections
+5 档：顶部优先，后文抽样约 65%，每批最多 8 个 selections
 ```
 
 真实 LatePost 验证记录：
 
 ```text
-URL: https://www.latepost.com/news/dj_detail?id=3558
-全文扫描: 122 chunks
-覆盖密度 3 档实际请求: 64 chunks
-请求批次: 16 batches
-旧全文全送策略: 122 chunks / 31 batches
+URL: https://www.latepost.com/news/dj_detail?id=3565
+全文扫描: 107 chunks
+覆盖密度 3 档实际请求: 42 chunks
+请求批次: 11 batches
+parsedCount: 42
+sanitizedCount: 41
+总耗时约 28.6s
+单批平均约 2.6s
+total_tokens 约 15.5k；第 3 批后 DeepSeek prompt cache 命中 768 tokens/batch
 ```
 
 测试产物在本地 `output/`，已加入 `.gitignore`，不要提交大截图或日志。
@@ -116,6 +133,8 @@ URL: https://www.latepost.com/news/dj_detail?id=3558
 - 不让 AI 直接生成最终 replacement。AI 只负责语义判断和英文表达，本地负责可靠执行。
 - 不做场景硬编码。上一版曾尝试用租房词和地名正则过滤，已移除。后续也不要用具体页面补丁替代通用策略。
 - 当前重点是 prompt 和 selection schema，而不是引入 npm 翻译包。
+- 默认覆盖密度已降为 `2`，以减少长文 token 和请求次数；用户保存过设置时仍以本地 storage 为准。
+- 替换浓度 `1/2` 已改成 word-first prompt：优先单个中文词或 2-4 字短词，phrase 只用于固定搭配或单词无法自然表达的强可迁移表达。
 
 AI 的职责：
 
@@ -139,12 +158,12 @@ AI 的职责：
 
 最近观察到的问题：
 
-- AI 有时仍选择低学习价值片段，例如朝向、地名、站名、楼盘名。
-- AI 有时生成不自然表达，例如把短语翻成完整句。
-- 替换数量偏少，尤其当 `isProperNoun/isTransferable/learningValue` 字段判断偏保守时。
+- 浓度 `2` 现在已有明显 word 回归，但 phrase 比例仍由 prompt 引导，不是硬比例约束；最近日志约为 word/phrase 接近一半一半。
+- 调试日志能看到 `parsed/sanitized`，但还没有 rejected reason；如果某批 parsed 大于 sanitized，只能从 quote 定位、重叠、模式校验或浓度配额推断原因。
 - 页面级缓存可能复用旧 prompt 结果；每次大幅调整 prompt 后应升级 `PROMPT_VERSION`。
-- SiliconFlow 当前响应非常不稳定，真实测试中大量 batch 会卡到 `12s` 超时。现有代码已降低请求量并支持流式应用，但 API 慢仍会影响整页完成时间。
+- DeepSeek 已替换原 SiliconFlow 接口。默认 base URL 为 `https://api.deepseek.com`，默认模型为 `deepseek-v4-flash`；如果本地仍保存旧 SiliconFlow 默认配置，启动时会自动迁移到 DeepSeek，并保留已有 API key 和学习参数。
 - 当前是串行请求，用户体验比全页等待好，但总耗时仍受超时批次数影响。
+- popup 是 Manifest V3 临时浮窗：只有打开期间能实时接收批次进度；关闭后再打开不会恢复正在进行的进度视图。
 
 当前通用过滤策略在 `src/background.ts`：
 
@@ -158,25 +177,20 @@ AI 的职责：
 
 ## 下一步建议
 
-优先级 1：继续优化 prompt，但保持通用。
-
-- 不要写具体租房词表。
-- 可以强化通用原则：选择“可复用表达”，避开“唯一标识信息”。
-- 可以要求 AI 对每个 selection 给一个简短 `reason`，方便调试为什么选它。
-- 可以把 `learningValue` 定义得更严格：1=无价值，3=可用，5=高频可迁移表达。
-
-优先级 2：改善“替换太少”。
-
-- 让 AI 每个 chunk 返回 4-8 个候选，本地再筛。
-- 降低本地 `learningValue` 阈值或按浓度动态调整阈值。
-- 对 `isProperNoun/isTransferable` 缺失的候选，目前本地不会直接拒绝；如果模型输出不稳定，先看完整日志再决定。
-
-优先级 3：让调试更直观。
+优先级 1：让调试更直观。
 
 - 在调试日志里加入 `acceptedSelections` 和 `rejectedSelections`，记录每条被拒原因。
-- popup 显示“AI 候选 N，最终替换 M”，便于判断是模型少选还是本地过滤太严。
-- popup 增加进度状态，例如“已完成 4/16 批，已替换 12 处”，让用户知道不是卡死。
-- 可以尝试并发 `2`、单批 timeout `8-10s`，但需要用真实 SiliconFlow 压测，避免供应商限流或更多超时。
+- popup 已显示批次耗时、候选数、有效数、累计替换数；后续可考虑把最终统计也写入 debug meta，方便复制分析。
+
+优先级 2：视情况约束浓度比例。
+
+- 目前浓度 2 的 word-first prompt 质量已经可接受，先不优化。
+- 如果用户后续仍觉得 phrase 太多，可以给本地过滤加硬比例，例如浓度 2 每批最多 1 个 phrase，或整页 phrase 不超过 word 的一半。
+
+优先级 3：速度和成本。
+
+- 默认覆盖密度已经降为 2，顶部必选和后文抽样都已变轻。
+- 可以尝试并发 `2`、单批 timeout `8-10s`，但需要用真实 DeepSeek 压测，避免供应商限流或更多超时。
 
 优先级 4：英文网页模式。
 
@@ -213,7 +227,7 @@ npm run current:extension -- 'https://www.latepost.com/news/dj_detail?id=3558'
 ```
 
 - `smoke:extension`：使用 mock API，适合验证 DOM 替换和基本流程。
-- `real-api:extension`：独立 Playwright Chromium + 真实 SiliconFlow API，适合验证真实接口慢/超时。
+- `real-api:extension`：独立 Playwright Chromium + 真实 DeepSeek API，适合验证真实接口表现。
 - `current:extension`：尝试控制用户当前 Chrome。当前机器标准 `http://127.0.0.1:9222/json/version` 返回 404，但可通过 `~/Library/Application Support/Google/Chrome/DevToolsActivePort` 读取 websocket 直连。长时间测试后该 websocket 可能握手超时，需要重启调试 Chrome 或改用 `real-api:extension`。
 
 ## Git/远程

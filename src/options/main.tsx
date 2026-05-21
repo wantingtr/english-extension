@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { DEBUG_LOG_KEY, DEFAULT_SETTINGS, SETTINGS_KEY } from "../sharedDefaults";
+import { DEBUG_LOG_KEY, DEFAULT_SETTINGS, SETTINGS_KEY, normalizeSettings } from "../sharedDefaults";
 import type { Settings } from "../types";
 import "./style.css";
 
@@ -21,11 +21,11 @@ const concentrationLabels = [
 ];
 
 const coverageLabels = [
-  "1 档：全文扫描，顶部优先 + 少量抽样",
-  "2 档：全文扫描，顶部优先 + 较低抽样",
-  "3 档：全文扫描，顶部优先 + 适中抽样",
-  "4 档：全文扫描，顶部优先 + 较高抽样",
-  "5 档：全文扫描，顶部优先 + 高抽样"
+  "1 档：顶部优先 + 极少抽样",
+  "2 档：顶部优先 + 轻量抽样",
+  "3 档：顶部优先 + 标准抽样",
+  "4 档：顶部优先 + 较高抽样",
+  "5 档：顶部优先 + 高抽样"
 ];
 
 type DebugLog = {
@@ -56,6 +56,7 @@ type DebugLog = {
     parsedCount?: number;
     sanitizedCount?: number;
     error?: string;
+    rawResponse?: string;
   }>;
   error?: string;
   networkErrorName?: string;
@@ -69,8 +70,10 @@ function App() {
 
   useEffect(() => {
     chrome.storage.local.get([SETTINGS_KEY, DEBUG_LOG_KEY]).then((stored) => {
-      setSettings({ ...DEFAULT_SETTINGS, ...(stored[SETTINGS_KEY] ?? {}) });
+      const normalizedSettings = normalizeSettings(stored[SETTINGS_KEY] as Partial<Settings> | undefined);
+      setSettings(normalizedSettings);
       setDebugLog((stored[DEBUG_LOG_KEY] as DebugLog | undefined) ?? null);
+      void chrome.storage.local.set({ [SETTINGS_KEY]: normalizedSettings });
     });
   }, []);
 
@@ -106,7 +109,7 @@ function App() {
         <section>
           <h2>AI API</h2>
           <label>
-            硅基流动 API key
+            DeepSeek API key
             <input
               type="password"
               value={settings.apiKey}

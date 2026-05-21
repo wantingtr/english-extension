@@ -37,4 +37,15 @@ export type RewriteResponse = {
   replacements: RewriteReplacement[];
   cached: boolean;
   streamed?: boolean;
+  batchTimings?: BatchTiming[];
+  totalElapsedMs?: number;
+};
+
+export type BatchTiming = {
+  index: number;
+  elapsedMs?: number;
+  httpStatus?: number;
+  parsedCount?: number;
+  sanitizedCount?: number;
+  error?: string;
 };

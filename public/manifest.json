@@ -10,8 +10,7 @@
   "options_page": "options.html",
   "permissions": ["activeTab", "storage", "scripting"],
   "host_permissions": [
-    "https://api.siliconflow.cn/*",
-    "https://api.siliconflow.com/*",
+    "https://api.deepseek.com/*",
     "https://*/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
