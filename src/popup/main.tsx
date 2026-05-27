@@ -121,31 +121,44 @@ function App() {
     <main className="popup">
       <header>
         <div>
-          <p className="eyebrow">Context English</p>
           <h1>语境英语</h1>
+          <p className="eyebrow">Context English</p>
         </div>
         <button className="iconButton" onClick={openOptions} title="打开设置">
           ⚙
         </button>
       </header>
 
-      <section className="panel">
-        <label htmlFor="mode">改造模式</label>
-        <select id="mode" value={mode} onChange={(event) => setMode(event.target.value as RewriteMode)}>
-          <option value="auto">自动判断</option>
-          <option value="zh-to-en">中文网页改造</option>
-          <option value="en-assist">英文网页改造</option>
-        </select>
+      <section className="panel" aria-label="改造模式">
+        {(Object.keys(modeLabels) as RewriteMode[]).map((item) => (
+          <button
+            key={item}
+            className={item === mode ? "modeButton active" : "modeButton"}
+            type="button"
+            onClick={() => setMode(item)}
+          >
+            {item === "auto" ? "自动" : item === "zh-to-en" ? "中文" : "英文"}
+          </button>
+        ))}
       </section>
 
       <section className="meta">
-        <span>难度 {settings.difficulty}</span>
-        <span>浓度 {settings.concentration}</span>
-        <span>覆盖 {settings.coverage}</span>
+        <span>
+          <small>难度</small>
+          {settings.difficulty}
+        </span>
+        <span>
+          <small>浓度</small>
+          {settings.concentration}
+        </span>
+        <span>
+          <small>覆盖</small>
+          {settings.coverage}
+        </span>
       </section>
 
       <button className="primary" disabled={busy} onClick={runRewrite}>
-        {busy ? "改造中..." : "改造当前页面"}
+        {busy ? "改造中..." : "改造当前页"}
       </button>
 
       <p className="status">{status}</p>

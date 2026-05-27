@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { DEBUG_LOG_KEY, DEFAULT_SETTINGS, SETTINGS_KEY, normalizeSettings } from "../sharedDefaults";
+import { DEBUG_LOG_KEY, DEFAULT_SETTINGS, SETTINGS_KEY, normalizeHost, normalizeSettings } from "../sharedDefaults";
 import type { Settings } from "../types";
 import "./style.css";
 
@@ -43,18 +43,25 @@ type DebugLog = {
   coverage: number;
   sourceChunkCount?: number;
   chunks: Array<{ id: string; text: string }>;
+  requestBody?: unknown;
   httpStatus?: number;
   rawResponse?: string;
   parsedCount?: number;
   sanitizedCount?: number;
+  acceptedSelections?: SelectionAudit[];
+  rejectedSelections?: SelectionAudit[];
   cached?: boolean;
   batchStatuses?: Array<{
     index: number;
     chunkIds: string[];
+    maxSelections?: number;
+    requestBody?: unknown;
     elapsedMs?: number;
     httpStatus?: number;
     parsedCount?: number;
     sanitizedCount?: number;
+    acceptedSelections?: SelectionAudit[];
+    rejectedSelections?: SelectionAudit[];
     error?: string;
     rawResponse?: string;
   }>;
@@ -63,10 +70,18 @@ type DebugLog = {
   networkErrorDetails?: string;
 };
 
+type SelectionAudit = {
+  selection: unknown;
+  reason?: string;
+  replacement?: unknown;
+};
+
 function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [debugLog, setDebugLog] = useState<DebugLog | null>(null);
   const [saved, setSaved] = useState(false);
+  const [hostInput, setHostInput] = useState("");
+  const [selectedHost, setSelectedHost] = useState("");
 
   useEffect(() => {
     chrome.storage.local.get([SETTINGS_KEY, DEBUG_LOG_KEY]).then((stored) => {
@@ -96,6 +111,29 @@ function App() {
   async function clearDebugLog() {
     await chrome.storage.local.remove(DEBUG_LOG_KEY);
     setDebugLog(null);
+  }
+
+  function addAutoHost() {
+    const host = normalizeHost(hostInput);
+    if (!host) {
+      return;
+    }
+
+    update("autoRewriteHosts", [...new Set([...settings.autoRewriteHosts, host])]);
+    setHostInput("");
+    setSelectedHost(host);
+  }
+
+  function removeAutoHost() {
+    if (!selectedHost) {
+      return;
+    }
+
+    update(
+      "autoRewriteHosts",
+      settings.autoRewriteHosts.filter((host) => host !== selectedHost)
+    );
+    setSelectedHost("");
   }
 
   return (
@@ -165,6 +203,44 @@ function App() {
           </label>
         </section>
 
+        <section>
+          <h2>自动改造白名单</h2>
+          <label>
+            域名
+            <div className="hostEditor">
+              <input
+                type="text"
+                value={hostInput}
+                placeholder="bytedance.larkoffice.com"
+                onChange={(event) => setHostInput(event.target.value)}
+              />
+              <button type="button" className="secondary" onClick={addAutoHost}>
+                添加
+              </button>
+            </div>
+          </label>
+          <label>
+            已启用域名
+            <select
+              size={Math.max(3, Math.min(6, settings.autoRewriteHosts.length || 3))}
+              value={selectedHost}
+              onChange={(event) => setSelectedHost(event.target.value)}
+            >
+              {settings.autoRewriteHosts.map((host) => (
+                <option key={host} value={host}>
+                  {host}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="hostActions">
+            <button type="button" className="secondary danger" disabled={!selectedHost} onClick={removeAutoHost}>
+              移除选中域名
+            </button>
+            <span className="hint">匹配该域名下所有路径；悬浮球可手动触发或暂停自动改造。</span>
+          </div>
+        </section>
+
         <footer>
           <button type="submit">保存设置</button>
           <span>{saved ? "已保存" : "修改后记得保存"}</span>
@@ -201,6 +277,8 @@ function App() {
             <DebugField label="请求段数" value={debugLog.chunks.length} />
             <DebugField label="解析数量" value={debugLog.parsedCount ?? "无"} />
             <DebugField label="有效替换" value={debugLog.sanitizedCount ?? "无"} />
+            <DebugField label="接受候选" value={debugLog.acceptedSelections?.length ?? "无"} />
+            <DebugField label="拒绝候选" value={debugLog.rejectedSelections?.length ?? "无"} />
             <DebugField label="请求批次" value={debugLog.batchStatuses?.length ?? "无"} />
             <DebugField label="缓存" value={debugLog.cached ? "是" : "否"} />
             <DebugField label="错误" value={debugLog.error ?? "无"} />
@@ -254,6 +332,8 @@ function formatFullDebugLog(debugLog: DebugLog): string {
         httpStatus: debugLog.httpStatus,
         parsedCount: debugLog.parsedCount,
         sanitizedCount: debugLog.sanitizedCount,
+        acceptedCount: debugLog.acceptedSelections?.length,
+        rejectedCount: debugLog.rejectedSelections?.length,
         batchStatuses: debugLog.batchStatuses,
         cached: debugLog.cached,
         error: debugLog.error,
@@ -261,6 +341,9 @@ function formatFullDebugLog(debugLog: DebugLog): string {
         networkErrorDetails: debugLog.networkErrorDetails
       },
       chunks: debugLog.chunks,
+      requestBody: debugLog.requestBody,
+      acceptedSelections: debugLog.acceptedSelections ?? [],
+      rejectedSelections: debugLog.rejectedSelections ?? [],
       rawResponse: debugLog.rawResponse || ""
     },
     null,

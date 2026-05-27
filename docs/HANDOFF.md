@@ -9,8 +9,10 @@
 - 中文网页改造：从中文正文中选择可迁移、高频、有学习价值的片段，替换成 `English(中文原文)`。
 - 英文网页改造：从英文正文中选择需要解释的难词或短语，替换成 `English(中文释义)`。
 - 手动触发：通过 popup 点击“改造当前页面”。
-- 设置项：DeepSeek API key、base URL、模型名、英文难度、替换浓度、覆盖密度。
-- 调试面板：options 页面底部展示完整日志，方便跨设备复制给 Codex。
+- 自动触发：options 里配置域名白名单后，匹配域名会自动改造，并在页面右侧显示可拖拽悬浮球。
+- 飞书/Lark 页面增强：白名单下支持自动改造、暂停/恢复、滚动/DOM 变化后的增量改造和本页 chunk 级缓存。
+- 设置项：DeepSeek API key、base URL、模型名、英文难度、替换浓度、覆盖密度、自动改造白名单。
+- 调试面板：options 页面底部展示完整日志、请求体、接受/拒绝候选及拒绝原因，方便复制给 Codex。
 
 构建验证命令：
 
@@ -31,12 +33,12 @@ Chrome 加载路径：
 
 主要文件：
 
-- `src/content.ts`：全文扫描正文 chunks、按覆盖密度选择请求 chunks、接收 popup 指令、流式应用批次结果、向 popup 转发批次进度、注入青绿色下划线样式。
-- `src/background.ts`：读取设置、分批调用 DeepSeek、解析 AI selections、校验 quote、生成最终 replacements、把每批成功结果回推给页面、写入调试日志和页面级缓存。
-- `src/popup/main.tsx`：模式选择、手动触发当前页改造、显示批次耗时/候选数/有效数/累计替换数和最终耗时统计。
-- `src/options/main.tsx`：API 和学习参数设置、完整调试日志。
-- `src/sharedDefaults.ts`：默认设置和 storage key。
-- `src/types.ts`：跨模块共享类型。
+- `src/content.ts`：全文扫描正文 chunks、按覆盖密度抽样、接收 popup 指令、流式应用批次结果、向 popup 转发进度、注入下划线和悬浮球样式；飞书/Lark 页面额外维护增量扫描、chunk stable key、本页 replacement cache 和 in-flight/processed 集合。
+- `src/background.ts`：读取设置、并发分批调用 DeepSeek、解析 AI selections、校验 quote、生成最终 replacements、把每批结果回推给页面、写入调试日志和页面级缓存；现在会记录 accepted/rejected selections 和 requestBody。
+- `src/popup/main.tsx`：分段按钮式模式选择、手动触发当前页改造、显示批次耗时/候选数/有效数/累计替换数和最终耗时统计。
+- `src/options/main.tsx`：API、学习参数、自动改造白名单设置、完整调试日志。
+- `src/sharedDefaults.ts`：默认设置、storage key、settings/host normalization。
+- `src/types.ts`：跨模块共享类型，包含自动白名单和部分失败 chunk 字段。
 
 当前 AI 协议是 **selection protocol**，不是直接 replacement protocol。
 
@@ -72,7 +74,7 @@ AI 应返回：
 
 ## 当前请求策略
 
-当前 prompt version 是 `selection-protocol-v6-word-first-concentration`。
+当前 prompt version 是 `selection-protocol-v9-partial-cache-safe`。
 
 默认 API 设置：
 
@@ -90,22 +92,31 @@ DeepSeek JSON Output 偶发空 `content`。当前策略是不重试：把该批�
 页面处理流程：
 
 1. content script 从 DOM 从上到下全文扫描可用正文，最多收集 `160` 个 chunk / `50,000` 字符作为安全上限。
-2. 顶部 `16` 个 chunk 必选，保证用户从上往下阅读时前几屏优先出现结果，同时控制 token 和请求次数。
-3. 顶部之后的正文按覆盖密度做确定性的均匀抽样，不做随机抽样，确保缓存稳定。
-4. 选中的 chunk 每 `4` 个组成一个 batch。
-5. background 串行请求 LLM，当前并发数为 `1`。
-6. 单批请求最多等待 `12s`；超时、`Failed to fetch`、候选 JSON 解析失败都视为可恢复批次错误，跳过该批并继续下一批。
-7. 每批成功后，background 通过 `IMMERSION_BATCH_RESULT` 立即发回当前 tab，content script 立刻替换对应 DOM，不再等整页全部完成。
-8. 所有批次结束后写入页面级缓存；命中缓存时仍一次性应用缓存结果。
+2. 正文按覆盖密度做确定性的均匀抽样，不做随机抽样，确保缓存稳定；8 个以内 chunk 默认全选。
+3. 选中的 chunk 每 `4` 个组成一个 batch。
+4. background 使用 worker queue 并发请求 LLM，当前并发数为 `3`。
+5. 单批请求最多等待 `18s`；超时、`Failed to fetch`、候选 JSON 解析失败都视为可恢复批次错误，跳过该批并继续下一批。
+6. 每批成功后，background 通过 `IMMERSION_BATCH_RESULT` 立即发回当前 tab，content script 立刻替换对应 DOM，不再等整页全部完成。
+7. replacements 会按原始请求 chunk 顺序排序，避免并发返回顺序影响最终结果。
+8. 只有所有 batch 都成功时才写入页面级缓存；出现失败 batch 时返回 `completedChunkIds`/`failedChunkIds`，避免缓存半截页面结果。
+
+飞书/Lark 自动改造流程：
+
+1. options 的“自动改造白名单”保存域名，例如 `bytedance.larkoffice.com`。
+2. content script 加载后读取 settings，匹配当前 hostname 或其子域名时，约 `800ms` 后自动触发改造。
+3. 页面右侧注入可拖拽悬浮球：白名单页点击可暂停/恢复自动改造，非白名单页点击可手动触发一次。
+4. 飞书页面会优先在可见文档根节点内收集正文，过滤目录、侧边栏、评论、AI 推荐等 chrome 文本。
+5. 飞书 chunk 使用 block id/元素路径 + 文本 hash 生成 stable key；已处理、正在请求、已有缓存的 chunk 不再重复发送。
+6. 初次改造后会监听滚动和 DOM 变化，`500ms` debounce 后最多取 `24` 个新增/可见 chunk 做增量改造。
 
 覆盖密度当前语义：
 
 ```text
-1 档：顶部优先，后文抽样约 8%，每批最多 1 个 selection
-2 档：顶部优先，后文抽样约 16%，每批最多 2 个 selections
-3 档：顶部优先，后文抽样约 28%，每批最多 4 个 selections
-4 档：顶部优先，后文抽样约 45%，每批最多 6 个 selections
-5 档：顶部优先，后文抽样约 65%，每批最多 8 个 selections
+1 档：均匀抽样约 12%，每 4 个 chunks 基准最多 1 个 selection
+2 档：均匀抽样约 24%，每 4 个 chunks 基准最多 2 个 selections
+3 档：均匀抽样约 36%，每 4 个 chunks 基准最多 4 个 selections
+4 档：均匀抽样约 50%，每 4 个 chunks 基准最多 6 个 selections
+5 档：均匀抽样约 68%，每 4 个 chunks 基准最多 8 个 selections
 ```
 
 真实 LatePost 验证记录：
@@ -159,11 +170,12 @@ AI 的职责：
 最近观察到的问题：
 
 - 浓度 `2` 现在已有明显 word 回归，但 phrase 比例仍由 prompt 引导，不是硬比例约束；最近日志约为 word/phrase 接近一半一半。
-- 调试日志能看到 `parsed/sanitized`，但还没有 rejected reason；如果某批 parsed 大于 sanitized，只能从 quote 定位、重叠、模式校验或浓度配额推断原因。
+- 调试日志已能看到 `acceptedSelections` 和 `rejectedSelections`，每条 rejected 会带原因；后续排查优先复制完整日志。
 - 页面级缓存可能复用旧 prompt 结果；每次大幅调整 prompt 后应升级 `PROMPT_VERSION`。
 - DeepSeek 已替换原 SiliconFlow 接口。默认 base URL 为 `https://api.deepseek.com`，默认模型为 `deepseek-v4-flash`；如果本地仍保存旧 SiliconFlow 默认配置，启动时会自动迁移到 DeepSeek，并保留已有 API key 和学习参数。
-- 当前是串行请求，用户体验比全页等待好，但总耗时仍受超时批次数影响。
+- 当前请求并发为 `3`，总耗时明显依赖 DeepSeek 当时延迟和失败批次数；如果遇到限流或更高错误率，可降回 `1-2`。
 - popup 是 Manifest V3 临时浮窗：只有打开期间能实时接收批次进度；关闭后再打开不会恢复正在进行的进度视图。
+- 飞书/Lark 增量改造主要按可见正文和 DOM 变化工作，复杂页面结构变化后 stable key 可能变化，导致同一文本再次请求。
 
 当前通用过滤策略在 `src/background.ts`：
 
@@ -177,9 +189,10 @@ AI 的职责：
 
 ## 下一步建议
 
-优先级 1：让调试更直观。
+优先级 1：真实页面回归。
 
-- 在调试日志里加入 `acceptedSelections` 和 `rejectedSelections`，记录每条被拒原因。
+- 在飞书/Lark 文档、普通中文网页、英文网页各跑一次真实改造。
+- 重点看悬浮球暂停/恢复、滚动增量触发、chunk 是否重复请求、失败 batch 是否不会污染缓存。
 - popup 已显示批次耗时、候选数、有效数、累计替换数；后续可考虑把最终统计也写入 debug meta，方便复制分析。
 
 优先级 2：视情况约束浓度比例。
@@ -213,6 +226,9 @@ AI 的职责：
 - `rawResponse`：AI 是否按 selections schema 返回。
 - `parsedCount`：解析到多少候选。
 - `sanitizedCount`：最终接受多少候选。
+- `requestBody`：实际发送给 DeepSeek 的 body，包含 prompt 和 chunk。
+- `acceptedSelections`：本地接受的候选和生成的 replacement。
+- `rejectedSelections`：本地拒绝的候选及原因。
 - `batchStatuses`：每批 chunk、耗时、HTTP 状态、解析/接受数量、是否超时。
 - `error`：是否有请求、解析或执行错误。
 

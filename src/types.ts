@@ -9,6 +9,7 @@ export type Settings = {
   difficulty: number;
   concentration: number;
   coverage: number;
+  autoRewriteHosts: string[];
 };
 
 export type TextChunk = {
@@ -39,6 +40,8 @@ export type RewriteResponse = {
   streamed?: boolean;
   batchTimings?: BatchTiming[];
   totalElapsedMs?: number;
+  completedChunkIds?: string[];
+  failedChunkIds?: string[];
 };
 
 export type BatchTiming = {

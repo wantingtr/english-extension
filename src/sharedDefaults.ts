@@ -6,7 +6,8 @@ export const DEFAULT_SETTINGS: Settings = {
   baseUrl: "https://api.deepseek.com",
   difficulty: 2,
   concentration: 3,
-  coverage: 2
+  coverage: 2,
+  autoRewriteHosts: []
 };
 
 export const SETTINGS_KEY = "englishImmersionSettings";
@@ -29,5 +30,40 @@ export function normalizeSettings(value: Partial<Settings> | undefined): Setting
     settings.model = DEFAULT_SETTINGS.model;
   }
 
+  settings.autoRewriteHosts = normalizeHosts(settings.autoRewriteHosts);
+
   return settings;
+}
+
+export function normalizeHosts(hosts: unknown): string[] {
+  if (!Array.isArray(hosts)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      hosts
+        .filter((host): host is string => typeof host === "string")
+        .map(normalizeHost)
+        .filter(Boolean)
+    )
+  ];
+}
+
+export function normalizeHost(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+    return url.hostname;
+  } catch {
+    return trimmed
+      .replace(/^https?:\/\//, "")
+      .split("/")[0]
+      .split(":")[0]
+      .trim();
+  }
 }

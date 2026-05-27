@@ -22,6 +22,7 @@ type AiSelection = {
 };
 
 type DebugLog = {
+  status: "running" | "completed" | "failed";
   timestamp: string;
   url: string;
   title: string;
@@ -36,37 +37,64 @@ type DebugLog = {
   coverage: number;
   sourceChunkCount?: number;
   chunks: Array<{ id: string; text: string }>;
+  requestBody?: ChatCompletionRequestBody;
   httpStatus?: number;
   rawResponse?: string;
   parsedCount?: number;
   sanitizedCount?: number;
+  acceptedSelections?: SelectionAudit[];
+  rejectedSelections?: SelectionAudit[];
   cached?: boolean;
   batchStatuses?: BatchStatus[];
   error?: string;
   networkErrorName?: string;
   networkErrorDetails?: string;
+  currentBatchIndex?: number;
+  completedBatchCount?: number;
+  totalBatchCount?: number;
 };
 
 type BatchStatus = {
   index: number;
   chunkIds: string[];
+  maxSelections?: number;
+  requestBody?: ChatCompletionRequestBody;
   elapsedMs?: number;
   httpStatus?: number;
   parsedCount?: number;
   sanitizedCount?: number;
+  acceptedSelections?: SelectionAudit[];
+  rejectedSelections?: SelectionAudit[];
   error?: string;
   rawResponse?: string;
+};
+
+type ChatCompletionRequestBody = {
+  model: string;
+  thinking: { type: "disabled" };
+  temperature: number;
+  max_tokens: number;
+  response_format: { type: "json_object" };
+  messages: Array<{ role: "system" | "user"; content: string }>;
+};
+
+type SelectionAudit = {
+  selection: AiSelection;
+  reason?: string;
+  replacement?: RewriteReplacement;
 };
 
 const CACHE_PREFIX = "rewriteCache:";
 const MAX_REPLACEMENTS = 96;
 const DEBUG_CHUNK_TEXT_LIMIT = 240;
 const DEBUG_RAW_RESPONSE_LIMIT = 12000;
-const PROMPT_VERSION = "selection-protocol-v6-word-first-concentration";
-const REQUEST_TIMEOUT_MS = 12_000;
+const DEBUG_BATCH_RAW_RESPONSE_LIMIT = 12000;
+const PROMPT_VERSION = "selection-protocol-v9-partial-cache-safe";
+const REQUEST_TIMEOUT_MS = 18_000;
 const CHUNKS_PER_AI_REQUEST = 4;
-const MAX_PARALLEL_AI_REQUESTS = 1;
+const MAX_PARALLEL_AI_REQUESTS = 3;
 const MAX_SELECTIONS_PER_AI_REQUEST = 8;
+const BASE_CHUNKS_PER_SELECTION_BUDGET = 4;
 
 chrome.runtime.onMessage.addListener((message: RewriteMessage, sender, sendResponse) => {
   if (message?.type !== "REWRITE_PAGE") {
@@ -108,16 +136,20 @@ async function handleRewrite(request: RewriteRequest, sender: chrome.runtime.Mes
   }
 
   const startedAt = Date.now();
-  const { replacements, batchTimings } = await rewriteWithDeepSeek(request, settings, debugLog, sender);
+  const { replacements, batchTimings, completedChunkIds, failedChunkIds } = await rewriteWithDeepSeek(request, settings, debugLog, sender);
   const cachedResponse: RewriteResponse = {
     replacements: replacements.slice(0, MAX_REPLACEMENTS),
     cached: false,
     streamed: false,
     batchTimings,
-    totalElapsedMs: Date.now() - startedAt
+    totalElapsedMs: Date.now() - startedAt,
+    completedChunkIds,
+    failedChunkIds
   };
 
-  await chrome.storage.local.set({ [cacheKey]: cachedResponse });
+  if (!failedChunkIds.length) {
+    await chrome.storage.local.set({ [cacheKey]: cachedResponse });
+  }
   return { ...cachedResponse, streamed: Boolean(request.requestId) };
 }
 
@@ -149,7 +181,12 @@ async function rewriteWithDeepSeek(
   settings: Settings,
   debugLog: DebugLog,
   sender: chrome.runtime.MessageSender
-): Promise<{ replacements: RewriteReplacement[]; batchTimings: BatchTiming[] }> {
+): Promise<{
+  replacements: RewriteReplacement[];
+  batchTimings: BatchTiming[];
+  completedChunkIds: string[];
+  failedChunkIds: string[];
+}> {
   const completionUrl = buildCompletionUrl(settings.baseUrl);
 
   try {
@@ -160,68 +197,103 @@ async function rewriteWithDeepSeek(
       throw new Error(`扩展没有访问 ${new URL(completionUrl).origin} 的权限，请重新构建并重新加载插件。`);
     }
 
-    const batches = chunkArray(request.chunks, CHUNKS_PER_AI_REQUEST);
+    const batches = createRequestBatches(request.chunks);
     const selections: AiSelection[] = [];
     const replacements: RewriteReplacement[] = [];
+    const acceptedSelections: SelectionAudit[] = [];
+    const rejectedSelections: SelectionAudit[] = [];
     const rawResponses: string[] = Array.from({ length: batches.length }, () => "");
     debugLog.batchStatuses = batches.map((chunks, index) => ({
       index: index + 1,
       chunkIds: chunks.map((chunk) => chunk.id)
     }));
+    debugLog.status = "running";
+    debugLog.completedBatchCount = 0;
+    debugLog.totalBatchCount = batches.length;
+    await saveDebugLog(debugLog);
 
-    for (let start = 0; start < batches.length; start += MAX_PARALLEL_AI_REQUESTS) {
-      const wave = batches.slice(start, start + MAX_PARALLEL_AI_REQUESTS);
-      await Promise.all(
-        wave.map(async (chunks, waveIndex) => {
-          const index = start + waveIndex;
-          const batchRequest = { ...request, chunks };
-          const status = debugLog.batchStatuses?.[index];
-          if (!status) {
-            return;
-          }
-          const startedAt = Date.now();
+    const processBatch = async (chunks: RewriteRequest["chunks"], index: number): Promise<void> => {
+      const batchRequest = { ...request, chunks };
+      const status = debugLog.batchStatuses?.[index];
+      if (!status) {
+        return;
+      }
+      const startedAt = Date.now();
+      debugLog.currentBatchIndex = status.index;
+      await saveDebugLog(debugLog);
 
-          try {
-            const content = await fetchModelContent(completionUrl, batchRequest, settings, status);
-            status.elapsedMs = Date.now() - startedAt;
-            rawResponses[index] = `Batch ${status.index}: ${content}`;
-            debugLog.rawResponse = rawResponses.filter(Boolean).join("\n\n").slice(0, DEBUG_RAW_RESPONSE_LIMIT);
-            await saveDebugLog(debugLog);
+      try {
+        const content = await fetchModelContent(completionUrl, batchRequest, settings, status);
+        status.elapsedMs = Date.now() - startedAt;
+        rawResponses[index] = `Batch ${status.index}: ${content}`;
+        debugLog.rawResponse = rawResponses.filter(Boolean).join("\n\n").slice(0, DEBUG_RAW_RESPONSE_LIMIT);
+        await saveDebugLog(debugLog);
 
-            const batchSelections = parseModelSelections(content);
-            status.parsedCount = batchSelections.length;
-            const batchReplacements = selectionsToReplacements(batchSelections, batchRequest, settings);
-            status.sanitizedCount = batchReplacements.length;
-            selections.push(...batchSelections);
-            replacements.push(...batchReplacements);
-            await emitBatchResult(request, sender, status, batchReplacements, batches.length);
-            await saveDebugLog(debugLog);
-          } catch (error) {
-            status.elapsedMs = Date.now() - startedAt;
-            status.error = error instanceof Error ? normalizeFetchError(error) : "改写失败，请稍后重试。";
-            await saveDebugLog(debugLog);
-            await emitBatchResult(request, sender, status, [], batches.length);
-            if (!isRecoverableBatchError(error)) {
-              throw error;
-            }
-          }
-        })
-      );
+        const batchSelections = parseModelSelections(content);
+        status.parsedCount = batchSelections.length;
+        const batchInspection = selectionsToReplacements(batchSelections, batchRequest, settings);
+        const batchReplacements = batchInspection.replacements;
+        status.sanitizedCount = batchReplacements.length;
+        status.acceptedSelections = batchInspection.acceptedSelections;
+        status.rejectedSelections = batchInspection.rejectedSelections;
+        selections.push(...batchSelections);
+        replacements.push(...batchReplacements);
+        acceptedSelections.push(...batchInspection.acceptedSelections);
+        rejectedSelections.push(...batchInspection.rejectedSelections);
+        await emitBatchResult(request, sender, status, batchReplacements, batches.length);
+        debugLog.completedBatchCount = (debugLog.completedBatchCount ?? 0) + 1;
+        await saveDebugLog(debugLog);
+      } catch (error) {
+        status.elapsedMs = Date.now() - startedAt;
+        status.error = error instanceof Error ? normalizeFetchError(error) : "改写失败，请稍后重试。";
+        debugLog.completedBatchCount = (debugLog.completedBatchCount ?? 0) + 1;
+        await saveDebugLog(debugLog);
+        await emitBatchResult(request, sender, status, [], batches.length);
+        if (!isRecoverableBatchError(error)) {
+          throw error;
+        }
+      }
+    };
 
+    let nextBatchIndex = 0;
+    const processBatchQueue = async (): Promise<void> => {
+      while (nextBatchIndex < batches.length) {
+        const index = nextBatchIndex;
+        nextBatchIndex += 1;
+        await processBatch(batches[index], index);
+      }
+    };
+    const workers = Array.from({ length: Math.min(MAX_PARALLEL_AI_REQUESTS, batches.length) }, processBatchQueue);
+    const results = await Promise.allSettled(workers);
+    const fatalResult = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (fatalResult) {
+      throw fatalResult.reason;
     }
 
+    const sortedReplacements = sortReplacementsByRequestOrder(replacements, request);
     debugLog.httpStatus = debugLog.batchStatuses.at(-1)?.httpStatus;
     debugLog.rawResponse = rawResponses.filter(Boolean).join("\n\n").slice(0, DEBUG_RAW_RESPONSE_LIMIT);
     debugLog.parsedCount = selections.length;
-    debugLog.sanitizedCount = replacements.length;
-    if (!replacements.length) {
-      const firstBatchError = debugLog.batchStatuses.find((status) => status.error)?.error;
+    debugLog.sanitizedCount = sortedReplacements.length;
+    debugLog.acceptedSelections = acceptedSelections;
+    debugLog.rejectedSelections = rejectedSelections;
+    debugLog.status = "completed";
+    debugLog.currentBatchIndex = undefined;
+    if (!sortedReplacements.length && debugLog.batchStatuses.every((status) => status.error)) {
+      const firstBatchError = debugLog.batchStatuses[0]?.error;
       if (firstBatchError) {
         throw new Error(firstBatchError);
       }
     }
+    const failedChunkIds = getFailedChunkIds(debugLog.batchStatuses);
+    const completedChunkIds = getCompletedChunkIds(debugLog.batchStatuses);
     await saveDebugLog(debugLog);
-    return { replacements: replacements.slice(0, MAX_REPLACEMENTS), batchTimings: getBatchTimings(debugLog.batchStatuses) };
+    return {
+      replacements: sortedReplacements.slice(0, MAX_REPLACEMENTS),
+      batchTimings: getBatchTimings(debugLog.batchStatuses),
+      completedChunkIds,
+      failedChunkIds
+    };
   } catch (error) {
     if (error instanceof Error) {
       debugLog.networkErrorName = error.name;
@@ -231,6 +303,7 @@ async function rewriteWithDeepSeek(
       debugLog.error = "改写失败，请稍后重试。";
       debugLog.networkErrorDetails = String(error);
     }
+    debugLog.status = "failed";
     await saveDebugLog(debugLog);
     throw error;
   }
@@ -244,6 +317,9 @@ async function fetchModelContent(
 ): Promise<string> {
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
+  const requestBody = buildChatCompletionRequestBody(request, settings);
+  batchStatus.requestBody = requestBody;
+  batchStatus.maxSelections = getMaxSelectionsForChunkCount(settings.coverage, request.chunks.length);
 
   try {
     const response = await fetch(completionUrl, {
@@ -253,31 +329,12 @@ async function fetchModelContent(
         Authorization: `Bearer ${settings.apiKey.trim()}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: settings.model,
-        thinking: { type: "disabled" },
-        temperature: 0,
-        max_tokens: 900,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: buildSystemPrompt(request.mode, settings, getMaxSelectionsPerRequest(settings.coverage))
-          },
-          {
-            role: "user",
-            content: JSON.stringify({
-              pageTitle: request.title,
-              chunks: request.chunks
-            })
-          }
-        ]
-      })
+      body: JSON.stringify(requestBody)
     });
 
     batchStatus.httpStatus = response.status;
     const rawResponse = await response.text();
-    batchStatus.rawResponse = rawResponse.slice(0, 4000);
+    batchStatus.rawResponse = rawResponse.slice(0, DEBUG_BATCH_RAW_RESPONSE_LIMIT);
 
     if (!response.ok) {
       if (response.status === 401) {
@@ -312,6 +369,31 @@ async function fetchModelContent(
   }
 }
 
+function buildChatCompletionRequestBody(request: RewriteRequest, settings: Settings): ChatCompletionRequestBody {
+  const maxSelections = getMaxSelectionsForChunkCount(settings.coverage, request.chunks.length);
+
+  return {
+    model: settings.model,
+    thinking: { type: "disabled" },
+    temperature: 0,
+    max_tokens: getMaxTokensForSelectionCount(maxSelections),
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: buildSystemPrompt(request.mode, settings, maxSelections)
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          pageTitle: request.title,
+          chunks: request.chunks
+        })
+      }
+    ]
+  };
+}
+
 function normalizeFetchError(error: Error): string {
   if (error.name === "AbortError") {
     return "单批请求超时，已跳过该批并继续处理其它内容。";
@@ -340,6 +422,10 @@ function chunkArray<T>(values: T[], size: number): T[][] {
   return chunks;
 }
 
+function createRequestBatches(chunks: RewriteRequest["chunks"]): RewriteRequest["chunks"][] {
+  return chunkArray(chunks, CHUNKS_PER_AI_REQUEST);
+}
+
 function getMaxSelectionsPerRequest(coverage: number): number {
   const normalizedCoverage = Math.min(5, Math.max(1, Math.round(coverage)));
   const values: Record<number, number> = {
@@ -350,6 +436,16 @@ function getMaxSelectionsPerRequest(coverage: number): number {
     5: MAX_SELECTIONS_PER_AI_REQUEST
   };
   return values[normalizedCoverage];
+}
+
+function getMaxSelectionsForChunkCount(coverage: number, chunkCount: number): number {
+  const base = getMaxSelectionsPerRequest(coverage);
+  const scale = Math.max(1, chunkCount / BASE_CHUNKS_PER_SELECTION_BUDGET);
+  return Math.min(MAX_REPLACEMENTS, Math.ceil(base * scale));
+}
+
+function getMaxTokensForSelectionCount(maxSelections: number): number {
+  return Math.min(1800, Math.max(760, 440 + maxSelections * 90));
 }
 
 async function emitBatchResult(
@@ -397,6 +493,14 @@ function getBatchTimings(statuses: BatchStatus[] | undefined): BatchTiming[] {
   }));
 }
 
+function getCompletedChunkIds(statuses: BatchStatus[] | undefined): string[] {
+  return (statuses ?? []).flatMap((status) => (status.error ? [] : status.chunkIds));
+}
+
+function getFailedChunkIds(statuses: BatchStatus[] | undefined): string[] {
+  return (statuses ?? []).flatMap((status) => (status.error ? status.chunkIds : []));
+}
+
 function buildCompletionUrl(baseUrl: string): string {
   const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
   if (!normalizedBaseUrl) {
@@ -416,76 +520,65 @@ async function hasHostPermission(url: string): Promise<boolean> {
 
 function buildSystemPrompt(mode: RewriteRequest["mode"], settings: Settings, maxSelections: number): string {
   const difficultyMap: Record<number, string> = {
-    1: "小学到初中，选择最常见、最基础的词汇和短语。",
-    2: "高中水平，选择常见生活、学习、工作表达。",
-    3: "大学四级水平，选择更自然的常用短语。",
-    4: "大学六级水平，选择更成熟的短语和抽象表达。",
-    5: "更高阶水平，选择地道表达、抽象词汇和短句。"
+    1: "基础词汇/短语",
+    2: "常见生活、学习、工作表达",
+    3: "大学四级常用自然表达",
+    4: "大学六级成熟表达",
+    5: "高阶地道表达"
   };
   const concentrationMap: Record<number, string> = {
-    1: "强制 word 优先，只选单个词或非常短的词组，不选 sentence。",
-    2: "word 优先，至少优先寻找单个词，只有固定搭配或单词无法自然表达时才选 phrase。",
-    3: "候选 word 和 phrase 均衡，谨慎选择 sentence。",
-    4: "候选以 phrase 为主，可少量选择 sentence。",
-    5: "减少 word，更多选择 phrase 和短 sentence。"
+    1: "word 优先，不选 sentence",
+    2: "word 优先，少量固定 phrase",
+    3: "word/phrase 均衡，谨慎 sentence",
+    4: "phrase 优先，少量短 sentence",
+    5: "phrase/短 sentence 更多"
   };
   const concentrationRuleMap: Record<number, string> = {
-    1: "浓度 1 的硬规则：优先选择单个中文词或 2-4 个汉字的短词，type 应主要为 word；每批最多 1 个 phrase，禁止 sentence。",
-    2: "浓度 2 的硬规则：先在每个 chunk 中寻找单个中文词或 2-4 个汉字的短词，type 应以 word 为主；只有“安全边际、资金拥挤、正反馈”这类固定搭配或单词无法自然学习时才选 phrase；每批 phrase 数量应少于 word。",
-    3: "浓度 3 的规则：word 和 phrase 均衡，只有短句本身很有学习价值时才选 sentence。",
-    4: "浓度 4 的规则：phrase 优先，可以少量选择短 sentence，但仍要避开整段翻译。",
-    5: "浓度 5 的规则：可以更多选择 phrase 和短 sentence，但每个 selection 仍必须短、可迁移、有学习价值。"
+    1: "规则：中文 quote 优先 2-4 字，type 主要 word；每批最多 1 个 phrase，禁止 sentence。",
+    2: "规则：中文 quote 优先 2-4 字，word 多于 phrase；phrase 只选固定搭配/强可迁移表达。",
+    3: "规则：word/phrase 均衡，sentence 只选很短且高价值的。",
+    4: "规则：phrase 优先，可少量短 sentence，禁止整段翻译。",
+    5: "规则：可更多 phrase/短 sentence，但必须短、可迁移、有学习价值。"
   };
   const modeTask =
     mode === "zh-to-en"
       ? [
-          "处理中文网页。你只负责选择适合学习的中文原文片段并给英文表达，不要生成最终替换文本。",
-          "quote 必须从 chunk 原文中逐字复制，不能改字、漏字、加空格、改标点或修正原文。",
-          "en 只写英文表达，不要加中文括注。本地程序会生成 en(quote)。",
-          "选择原则必须通用：优先选择可迁移到其他语境的高频表达、状态描述、动作表达、关系表达、条件表达、评价表达。",
-          "避免选择只能用于当前页面的唯一标识信息，例如专有名词、具体名称、编号、价格、日期、距离、面积、地址、联系方式。",
-          "如果一个片段混合了唯一标识信息和通用表达，只选择其中可迁移的通用表达。",
-          "en 要自然、可复用。浓度 1-2 时优先给单词级英文；浓度 3-5 时才更多使用英文短语。不要逐字硬翻，也不要把整句写成完整英文句子。",
-          "每个 chunk 最多选择 2 个候选。禁止选择整段长句。"
+          "中文网页：选适合英语学习的中文原文 quote，并给自然英文 en。",
+          "只选可迁移的高频表达/动作/状态/关系/评价；避开专名、数字、日期、价格、URL、代码、当前页唯一信息。",
+          "quote 必须从 chunk.text 逐字复制；en 只写英文，不加中文括注；本地会生成 en(quote)。",
+          "每个 chunk 0-2 个候选；禁止整段翻译；宁可少选。"
         ].join("\n")
       : [
-          "处理英文网页。你只负责选择适合解释的英文原文片段并给中文释义，不要生成最终替换文本。",
-          "quote 必须从 chunk 原文中逐字复制，不能改字、漏字、加空格、改标点或修正原文。",
-          "zh 只写中文释义，不要重复 quote。本地程序会生成 quote(zh)。",
-          "每个 chunk 最多选择 2 个候选。优先选择难词、短语、短表达，禁止选择整段长句。"
+          "英文网页：选适合解释的英文原文 quote，并给中文 zh。",
+          "quote 必须从 chunk.text 逐字复制；zh 只写中文释义；本地会生成 quote(zh)。",
+          "每个 chunk 0-2 个候选；优先难词/短语/短表达，禁止整段长句。"
         ].join("\n");
 
   return [
-    "你是一个英文学习网页候选片段选择器，不是网页翻译器。",
+    "你是英文学习网页候选片段选择器，不是翻译器。",
     modeTask,
-    `英语难度：${settings.difficulty} 档，${difficultyMap[settings.difficulty]}`,
-    `替换浓度：${settings.concentration} 档，${concentrationMap[settings.concentration]}`,
+    `难度 ${settings.difficulty}：${difficultyMap[settings.difficulty]}。浓度 ${settings.concentration}：${concentrationMap[settings.concentration]}。覆盖 ${settings.coverage}。`,
     concentrationRuleMap[settings.concentration],
-    `覆盖密度：${settings.coverage} 档。页面会全文扫描；该档位只控制每批候选数量和替换积极程度，不允许选择整段凑数。`,
-    `本次最多返回 ${maxSelections} 个 selection。宁可少选，也不要补无价值候选。`,
-    "严格输出：",
-    '1. 只返回 JSON，不要 Markdown，不要代码块，不要解释。格式：{"selections":[...]}',
-    "2. 每个 selection 必须包含 chunkId、quote、start、end、type、level、isProperNoun、isTransferable、learningValue。",
+    `最多返回 ${maxSelections} 个 selection；不要为凑数选低价值内容。`,
+    "输出严格 JSON，无 Markdown/解释：",
+    '1. 格式：{"selections":[...]}',
+    "2. 每个 selection 只包含 chunkId、quote、type，以及 en 或 zh。",
     mode === "zh-to-en"
-      ? "3. 中文模式每个 selection 必须包含 en；quote 必须含中文；en 必须含英文。"
-      : "3. 英文模式每个 selection 必须包含 zh；quote 必须含英文；zh 必须含中文。",
-    "4. isProperNoun 表示 quote 是否是当前页面特有的专名或唯一标识；isTransferable 表示 quote 是否可迁移到其他语境学习；learningValue 为 1-5。",
-    "5. start/end 是 quote 在 chunk.text 中的 JavaScript 字符串下标，end 为开区间。",
-    "6. 如果不确定下标，也必须保证 quote 在 chunk.text 中精确存在。",
-    "7. type 只能是 word、phrase、sentence。",
+      ? "3. 中文模式：quote 含中文，en 含英文且不含中文。"
+      : "3. 英文模式：quote 含英文，zh 含中文。",
+    "4. type 只能是 word、phrase、sentence。",
     mode === "zh-to-en"
       ? settings.concentration <= 2
-        ? "8. 中文 quote 在浓度 1-2 时优先 2-4 个汉字的单词或短词，type 优先 word；phrase 必须是固定搭配或强可迁移表达，最多不要超过 8 个汉字；不要选 sentence。"
-        : "8. 中文 quote 优先 2-10 个汉字，最多不要超过 16 个汉字；除非浓度为 5，否则不要选 sentence。"
-      : "8. 英文 quote 优先 1-6 个英文词，不要整段解释。",
+        ? "5. 中文 quote 优先 2-4 字；phrase 最多 8 字；不要 sentence。"
+        : "5. 中文 quote 优先 2-10 字，最多 16 字；浓度非 5 时尽量不选 sentence。"
+      : "5. 英文 quote 优先 1-6 个词。",
     mode === "zh-to-en"
-      ? `9. 中文模式每个 chunk 选择 0-2 个 selection，本次总数不得超过 ${maxSelections}；只选择 isTransferable=true 且 learningValue>=3 的候选。`
-      : `9. 英文模式每个 chunk 选择 0-2 个 selection，本次总数不得超过 ${maxSelections}。`,
-    "10. 不要选择 isProperNoun=true 的候选，不要选择数字、日期、URL、代码、价格。",
-    '11. 如果没有合适候选，返回 {"selections":[]}。',
+      ? "6. 不要返回专名/不可迁移/数字日期价格 URL 代码。"
+      : "6. 不要返回专名/不可迁移/数字日期价格 URL 代码。",
+    '7. 没有合适候选返回 {"selections":[]}。',
     mode === "zh-to-en"
-      ? '12. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"原文片段","start":0,"end":4,"en":"natural English","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
-      : '12. 示例结构：{"selections":[{"chunkId":"chunk-0","quote":"source phrase","start":0,"end":13,"zh":"中文释义","type":"phrase","level":2,"isProperNoun":false,"isTransferable":true,"learningValue":4}]}'
+      ? '示例：{"selections":[{"chunkId":"chunk-0","quote":"原文片段","en":"natural English","type":"phrase"}]}'
+      : '示例：{"selections":[{"chunkId":"chunk-0","quote":"source phrase","zh":"中文释义","type":"phrase"}]}'
   ].join("\n");
 }
 
@@ -663,29 +756,45 @@ function selectionsToReplacements(
   selections: AiSelection[],
   request: RewriteRequest,
   settings: Settings
-): RewriteReplacement[] {
+): { replacements: RewriteReplacement[]; acceptedSelections: SelectionAudit[]; rejectedSelections: SelectionAudit[] } {
   const chunksById = new Map(request.chunks.map((chunk) => [chunk.id, chunk.text]));
   const seen = new Set<string>();
   const replacements: RewriteReplacement[] = [];
+  const acceptedSelections: SelectionAudit[] = [];
+  const rejectedSelections: SelectionAudit[] = [];
   const typeCounts = { word: 0, phrase: 0, sentence: 0 };
 
   for (const selection of selections) {
     const chunkText = chunksById.get(selection.chunkId);
-    if (!chunkText || !isAllowedByMode(selection, request.mode)) {
+    if (!chunkText) {
+      rejectedSelections.push({ selection, reason: "chunkId 不在本批请求 chunks 中" });
+      continue;
+    }
+
+    const modeReason = getModeRejectionReason(selection, request.mode);
+    if (modeReason) {
+      rejectedSelections.push({ selection, reason: modeReason });
       continue;
     }
 
     const match = locateQuote(chunkText, selection);
     if (!match) {
+      rejectedSelections.push({ selection, reason: "quote 无法在 chunk.text 中精确定位" });
       continue;
     }
 
     const key = `${selection.chunkId}:${match.start}:${match.end}`;
-    if (seen.has(key) || overlapsExisting(replacements, selection.chunkId, match.quote)) {
+    if (seen.has(key)) {
+      rejectedSelections.push({ selection, reason: "与已接受候选位置重复" });
+      continue;
+    }
+    if (overlapsExisting(replacements, selection.chunkId, match.quote)) {
+      rejectedSelections.push({ selection, reason: "与已接受候选文本重叠" });
       continue;
     }
 
     if (!fitsConcentration(selection.type, settings.concentration, typeCounts)) {
+      rejectedSelections.push({ selection, reason: `超过浓度 ${settings.concentration} 的 ${selection.type} 配额` });
       continue;
     }
 
@@ -696,20 +805,41 @@ function selectionsToReplacements(
         ? `${cleanInlineText(selection.en ?? "")}(${match.quote})`
         : `${match.quote}(${cleanInlineText(selection.zh ?? "")})`;
 
-    replacements.push({
+    const replacementItem = {
       chunkId: selection.chunkId,
       original: match.quote,
       replacement,
       explanation: selection.explanation ?? replacement,
       type: selection.type
-    });
+    };
+    replacements.push(replacementItem);
+    acceptedSelections.push({ selection, replacement: replacementItem });
 
     if (replacements.length >= MAX_REPLACEMENTS) {
       break;
     }
   }
 
-  return replacements;
+  return { replacements, acceptedSelections, rejectedSelections };
+}
+
+function sortReplacementsByRequestOrder(
+  replacements: RewriteReplacement[],
+  request: RewriteRequest
+): RewriteReplacement[] {
+  const chunkOrder = new Map(request.chunks.map((chunk, index) => [chunk.id, index]));
+  const chunkTextById = new Map(request.chunks.map((chunk) => [chunk.id, chunk.text]));
+
+  return [...replacements].sort((left, right) => {
+    const leftChunkIndex = chunkOrder.get(left.chunkId) ?? Number.MAX_SAFE_INTEGER;
+    const rightChunkIndex = chunkOrder.get(right.chunkId) ?? Number.MAX_SAFE_INTEGER;
+    if (leftChunkIndex !== rightChunkIndex) {
+      return leftChunkIndex - rightChunkIndex;
+    }
+
+    const text = chunkTextById.get(left.chunkId) ?? "";
+    return text.indexOf(left.original) - text.indexOf(right.original);
+  });
 }
 
 function locateQuote(chunkText: string, selection: AiSelection): { quote: string; start: number; end: number } | null {
@@ -737,11 +867,11 @@ function locateQuote(chunkText: string, selection: AiSelection): { quote: string
   return null;
 }
 
-function isAllowedByMode(selection: AiSelection, mode: RewriteRequest["mode"]): boolean {
+function getModeRejectionReason(selection: AiSelection, mode: RewriteRequest["mode"]): string | null {
   const quote = selection.quote.trim();
 
   if (!["word", "phrase", "sentence"].includes(selection.type)) {
-    return false;
+    return "type 不是 word/phrase/sentence";
   }
 
   if (mode === "zh-to-en") {
@@ -749,33 +879,33 @@ function isAllowedByMode(selection: AiSelection, mode: RewriteRequest["mode"]): 
     const en = selection.en?.trim() ?? "";
 
     if (quoteZhCount === 0 || !/[A-Za-z]/.test(en) || /[\u4e00-\u9fff]/.test(en)) {
-      return false;
+      return "中文模式要求 quote 含中文，en 含英文且不含中文";
     }
     if (selection.isProperNoun === true || selection.isTransferable === false) {
-      return false;
+      return "专名或不可迁移候选";
     }
     if (typeof selection.learningValue === "number" && selection.learningValue < 3) {
-      return false;
+      return "learningValue 低于 3";
     }
     if (selection.type === "sentence" && quoteZhCount > 18) {
-      return false;
+      return "sentence quote 超过 18 个汉字";
     }
     if (selection.type !== "sentence" && quoteZhCount > 14) {
-      return false;
+      return "word/phrase quote 超过 14 个汉字";
     }
 
-    return true;
+    return null;
   }
 
   const zh = selection.zh?.trim() ?? "";
   if (!/[A-Za-z]/.test(quote) || !/[\u4e00-\u9fff]/.test(zh)) {
-    return false;
+    return "英文模式要求 quote 含英文，zh 含中文";
   }
   if (selection.isProperNoun === true || selection.isTransferable === false) {
-    return false;
+    return "专名或不可迁移候选";
   }
 
-  return true;
+  return null;
 }
 
 function fitsConcentration(
@@ -893,6 +1023,7 @@ function countMatches(value: string, pattern: RegExp): number {
 
 function createBaseDebugLog(request: RewriteRequest, settings: Settings): DebugLog {
   return {
+    status: "running",
     timestamp: new Date().toISOString(),
     url: request.url,
     title: request.title,
@@ -903,6 +1034,7 @@ function createBaseDebugLog(request: RewriteRequest, settings: Settings): DebugL
     difficulty: settings.difficulty,
     concentration: settings.concentration,
     coverage: settings.coverage,
+    requestBody: buildChatCompletionRequestBody(request, settings),
     sourceChunkCount: request.sourceChunkCount,
     chunks: request.chunks.map((chunk) => ({
       id: chunk.id,
