@@ -1,14 +1,14 @@
-# 语境英语 Hand-off
+# Chinglishify Hand-off
 
 ## 当前状态
 
-这是一个本地自用的 Chrome Manifest V3 插件。当前产品名为 **语境英语**，英文标识为 **Context English**。
+这是一个本地自用的 Chrome Manifest V3 插件。当前产品名为 **Chinglishify**。
 
 核心能力：
 
 - 中文网页改造：从中文正文中选择可迁移、高频、有学习价值的片段，替换成 `English(中文原文)`。
 - 英文网页改造：从英文正文中选择需要解释的难词或短语，替换成 `English(中文释义)`。
-- 手动触发：通过 popup 点击“改造当前页面”。
+- 手动触发：通过 popup 点击“Chinglishify 当前页”。
 - 自动触发：options 里配置域名白名单后，匹配域名会自动改造，并在页面右侧显示可拖拽悬浮球。
 - 飞书/Lark 页面增强：白名单下支持自动改造、暂停/恢复、滚动/DOM 变化后的增量改造和本页 chunk 级缓存。
 - 设置项：DeepSeek API key、base URL、模型名、英文难度、替换浓度、覆盖密度、自动改造白名单。
@@ -28,6 +28,27 @@ Chrome 加载路径：
 ```
 
 如果源码改动后已经重新 build，Chrome 扩展页点刷新/更新即可；目标网页仍需刷新，因为 content script 已注入旧页面。
+
+## 迁移到其他设备
+
+推荐复制整个项目目录，但不要带这些生成物：
+
+```text
+node_modules/
+output/
+dist/
+```
+
+到新设备后运行：
+
+```bash
+npm install
+npm run build
+```
+
+然后在 Chrome `chrome://extensions` 加载新设备项目里的 `dist` 目录。
+
+只想直接使用成品时，也可以只复制 `dist/` 并在 Chrome 加载该目录；但这样不能方便改代码或重新构建。API key 不在项目文件里，而是在 Chrome 扩展本地存储里，新设备加载后需要重新打开 Chinglishify 设置页填写 DeepSeek API key。
 
 ## 关键架构
 
@@ -213,9 +234,9 @@ AI 的职责：
 ## 调试流程
 
 1. `npm run build`
-2. Chrome `chrome://extensions` 刷新 **语境英语**
+2. Chrome `chrome://extensions` 刷新 **Chinglishify**
 3. 刷新目标网页
-4. 点击插件 popup 的“改造当前页面”
+4. 点击插件 popup 的“Chinglishify 当前页”
 5. 打开设置页底部“调试面板”
 6. 复制完整日志给 Codex
 

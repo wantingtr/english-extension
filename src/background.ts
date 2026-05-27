@@ -602,7 +602,7 @@ function parseModelSelections(content: string): AiSelection[] {
     return recovered;
   }
 
-  console.warn("[English Immersion] Raw model response was not parseable selections JSON:", content);
+  console.warn("[Chinglishify] Raw model response was not parseable selections JSON:", content);
   throw new Error("模型返回的候选 JSON 无法解析，请重试；设置页调试面板可查看原始返回。");
 }
 

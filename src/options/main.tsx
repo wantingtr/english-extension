@@ -139,8 +139,8 @@ function App() {
   return (
     <main className="options">
       <header>
-        <p className="eyebrow">Context English</p>
-        <h1>语境英语设置</h1>
+        <p className="eyebrow">Context Mischief</p>
+        <h1>Chinglishify 设置</h1>
       </header>
 
       <form onSubmit={saveSettings}>

@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "语境英语",
-  "description": "用 AI 在真实网页语境中生成可控的英语接触。",
+  "name": "Chinglishify",
+  "description": "用 AI 把真实网页轻轻 Chinglishify 一下。",
   "version": "0.1.0",
   "action": {
-    "default_title": "语境英语",
+    "default_title": "Chinglishify",
     "default_popup": "popup.html"
   },
   "options_page": "options.html",

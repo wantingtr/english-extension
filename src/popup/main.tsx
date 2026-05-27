@@ -45,7 +45,7 @@ const modeLabels: Record<RewriteMode, string> = {
 function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [mode, setMode] = useState<RewriteMode>("auto");
-  const [status, setStatus] = useState("准备改造当前页面");
+  const [status, setStatus] = useState("准备 Chinglishify 当前页面");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -121,8 +121,8 @@ function App() {
     <main className="popup">
       <header>
         <div>
-          <h1>语境英语</h1>
-          <p className="eyebrow">Context English</p>
+          <h1>Chinglishify</h1>
+          <p className="eyebrow">Context Mischief</p>
         </div>
         <button className="iconButton" onClick={openOptions} title="打开设置">
           ⚙
@@ -158,7 +158,7 @@ function App() {
       </section>
 
       <button className="primary" disabled={busy} onClick={runRewrite}>
-        {busy ? "改造中..." : "改造当前页"}
+        {busy ? "Chinglishify 中..." : "Chinglishify 当前页"}
       </button>
 
       <p className="status">{status}</p>

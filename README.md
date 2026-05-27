@@ -1,6 +1,6 @@
-# 语境英语
+# Chinglishify
 
-一个本地自用的 Chrome Manifest V3 插件，用 DeepSeek OpenAI-compatible API 在真实网页语境中生成可控的英语接触。
+一个本地自用的 Chrome Manifest V3 插件，用 DeepSeek OpenAI-compatible API 把真实网页轻轻 Chinglishify 一下。
 
 ## 使用
 
@@ -15,7 +15,7 @@ npm run build
 2. 点击“加载已解压的扩展程序”。
 3. 选择本项目的 `dist` 目录。
 4. 打开插件设置页，填写 DeepSeek API key。
-5. 在普通网页点击插件图标，选择模式，点击“改造当前页面”。
+5. 在普通网页点击插件图标，选择模式，点击“Chinglishify 当前页”。
 
 ## 功能
 

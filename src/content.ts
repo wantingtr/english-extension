@@ -147,7 +147,7 @@ function createFloatingBall(whitelisted: boolean, settings: ContentSettings) {
   const button = document.createElement("button");
   button.id = FLOATING_BALL_ID;
   button.type = "button";
-  button.setAttribute("aria-label", whitelisted ? "暂停语境英语自动改造" : "语境英语改造当前页面");
+  button.setAttribute("aria-label", whitelisted ? "暂停 Chinglishify 自动改造" : "Chinglishify 当前页面");
   button.dataset.whitelisted = String(whitelisted);
   button.dataset.status = "点击改造";
   setupFloatingBallDrag(button);
