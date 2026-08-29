@@ -14,6 +14,34 @@
 - 设置项：DeepSeek API key、base URL、模型名、英文难度、替换浓度、覆盖密度、自动改造白名单。
 - 调试面板：options 页面底部展示完整日志、请求体、接受/拒绝候选及拒绝原因，方便复制给 Codex。
 
+## 2026-08-30：个人电脑迁移与电子书 Skill
+
+仓库已同步到 GitHub：`https://github.com/wantingtr/english-extension.git`。电子书能力不在 Chrome 扩展代码中，而是在仓库根目录的 `skills/english-book-converter/`；其唯一执行脚本是：
+
+```text
+skills/english-book-converter/scripts/convert_book.py
+```
+
+新电脑恢复步骤：
+
+```bash
+git clone https://github.com/wantingtr/english-extension.git
+cd english-extension
+npm ci
+ln -s "$(pwd)/skills/english-book-converter" "$HOME/.codex/skills/english-book-converter"
+python3 skills/english-book-converter/scripts/test_convert_book.py
+```
+
+随后在 Codex 上传电子书并说：
+
+```text
+使用 $english-book-converter，把这本书转成默认轻度英语学习版。
+```
+
+Skill 的流程是先做 `--dry-run` 格式预检和低密度候选筛选，再由 Codex 或用户配置的兼容模型处理候选，最后输出带 `English(原中文)` 和青绿色下划线的 EPUB。PDF 一律拒绝；MOBI/AZW/AZW3 仅在本机有 Calibre 且文件无 DRM 时尝试转换；不会绕过 DRM。
+
+验证状态：电子书脚本的 3 项测试已通过（TXT 转 EPUB、EPUB 再处理、PDF 拒绝）。原 Chrome 扩展的 `npx vite build` 已通过；`npm run build` 仍会在 TypeScript 检查阶段报缺少 Node 类型（`node:path` 和 `__dirname`），这是远端仓库原有配置问题，本次未改依赖。
+
 构建验证命令：
 
 ```bash
